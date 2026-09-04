@@ -66,7 +66,7 @@ should render its own Secret.
 {{- define "oura-mcp.createSecret" -}}
 {{- if .Values.existingSecret }}
 {{- "false" }}
-{{- else if or .Values.secrets.ouraClientId .Values.secrets.ouraClientSecret .Values.secrets.mcpApiKey .Values.secrets.tokenEncryptionKey .Values.secrets.mongodbUri .Values.secrets.redisUrl .Values.secrets.ouraWebhookVerificationToken }}
+{{- else if or .Values.secrets.ouraClientId .Values.secrets.ouraClientSecret .Values.secrets.mcpApiKey .Values.secrets.tokenEncryptionKey .Values.secrets.mongodbUri .Values.secrets.redisUrl .Values.secrets.ouraWebhookVerificationToken .Values.secrets.mcpOwnerPassword }}
 {{- "true" }}
 {{- else }}
 {{- "false" }}

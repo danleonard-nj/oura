@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from oura_mcp.infrastructure.logging import get_logger
 from oura_mcp.models.audit import AuditEvent
 from oura_mcp.repositories.audit_repository import AuditRepository
@@ -22,9 +24,10 @@ class AuditService:
         self._repository = repository
 
     async def record(self, event: AuditEvent) -> None:
-        logger.info(
+        logger.log(
+            logging.WARNING if event.status in {"error", "partial"} else logging.INFO,
             f"{event.action.value} {event.status}",
-            extra={
+            extra={key: value for key, value in {
                 "correlation_id": event.correlation_id,
                 "action": event.action.value,
                 "account_id": event.account_id,
@@ -37,7 +40,8 @@ class AuditService:
                 "upstream_status": event.upstream_status,
                 "result_status": event.status,
                 "error_category": event.error_category,
-            },
+                "error_message": event.error_message,
+            }.items() if value is not None},
         )
         try:
             await self._repository.record(event)

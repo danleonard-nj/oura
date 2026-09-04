@@ -28,21 +28,21 @@ from collections.abc import AsyncIterator
 from dotenv import load_dotenv
 from pymongo import AsyncMongoClient
 from pymongo.asynchronous.database import AsyncDatabase
+from httpx2 import AsyncClient
 from redis.asyncio import Redis
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.routing import Route
 
-from oura_mcp.api import oauth, routes, webhooks
+from oura_mcp.api import consent, oauth, routes, webhooks
 from oura_mcp.api.auth import BearerTokenMiddleware
 from oura_mcp.api.dependencies import CorrelationIdMiddleware
 from oura_mcp.config import Config, load_config
 from oura_mcp.container import build_provider
-from oura_mcp.infrastructure.executor import ThreadOffloader
 from oura_mcp.infrastructure.logging import configure_logging, get_logger
 from oura_mcp.infrastructure.mongo import ensure_indexes
 from oura_mcp.mcp.context import ToolContext
-from oura_mcp.mcp.server import build_mcp_app, build_mcp_server
+from oura_mcp.mcp.server import build_mcp_app, build_mcp_server, build_oauth_routes
 
 logger = get_logger(__name__)
 
@@ -62,7 +62,19 @@ def create_app(config: Config | None = None) -> Starlette:
     context = ToolContext()
     mcp_server = build_mcp_server(config, context)
     mcp_app = build_mcp_app(mcp_server, config)
-    guarded_mcp = BearerTokenMiddleware(mcp_app, config.mcp_api_key.get_secret_value())
+
+    # OAuth routes live on the root app, not inside the MCP sub-app. The MCP
+    # app is attached at exactly `/mcp`, so anything the SDK mounted alongside
+    # it -- /authorize, /token, /register, the discovery documents -- would be
+    # unreachable. `build_oauth_routes` produces them for the root table.
+    oauth_routes, resource_metadata_url = build_oauth_routes(config, context)
+
+    guarded_mcp = BearerTokenMiddleware(
+        mcp_app,
+        config.mcp_api_key.get_secret_value(),
+        token_loader=_oauth_token_loader(context) if config.mcp_oauth_enabled else None,
+        resource_metadata_url=resource_metadata_url,
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -88,6 +100,7 @@ def create_app(config: Config | None = None) -> Starlette:
                 "public_host": config.public_host or None,
                 "account_id": config.oura_account_id,
                 "cache_enabled": config.cache_enabled,
+                "mcp_oauth": config.mcp_oauth_enabled,
             },
         )
 
@@ -100,6 +113,8 @@ def create_app(config: Config | None = None) -> Starlette:
     return Starlette(
         routes=[
             Route(config.mcp_path, endpoint=guarded_mcp),
+            *oauth_routes,
+            *(consent.ROUTES if config.mcp_oauth_enabled else []),
             *routes.ROUTES,
             *oauth.ROUTES,
             *webhooks.ROUTES,
@@ -109,11 +124,21 @@ def create_app(config: Config | None = None) -> Starlette:
     )
 
 
+def _oauth_token_loader(context: ToolContext):
+    """Validate an OAuth access token, resolved lazily from the provider."""
+    from oura_mcp.services.mcp_auth_service import McpAuthService
+
+    async def load(token: str):
+        return await context.resolve(McpAuthService).load_access_token(token)
+
+    return load
+
+
 async def _shutdown(provider) -> None:
     """Close what we opened, in reverse order, tolerating partial failures."""
     logger.info("oura-mcp shutting down")
     with contextlib.suppress(Exception):
-        provider.resolve(ThreadOffloader).shutdown()
+        await provider.resolve(AsyncClient).aclose()
     with contextlib.suppress(Exception):
         await provider.resolve(Redis).aclose()
     with contextlib.suppress(Exception):

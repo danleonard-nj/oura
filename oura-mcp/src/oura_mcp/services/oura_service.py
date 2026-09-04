@@ -4,9 +4,8 @@ Everything above this line -- MCP tools, HTTP routes -- deals in resources,
 date ranges and plain dictionaries. Everything below it deals in bearer tokens,
 `requests` exceptions and worker threads. This service is the seam.
 
-It owns four things:
+It owns three things:
 
-* offloading the synchronous `oura-ring` client off the event loop,
 * the cache read/write around each fetch,
 * translating upstream failures into `OuraError` subclasses, and
 * the retry policy, including the refresh-and-retry-once path for a 401.
@@ -19,11 +18,10 @@ import random
 import time
 from typing import Any
 
-import requests
+import httpx2
 
-from oura_mcp.clients.oura_client import BlockingOuraClient
+from oura_mcp.clients.oura_client import OuraApiClient
 from oura_mcp.config import Config
-from oura_mcp.infrastructure.executor import ThreadOffloader
 from oura_mcp.infrastructure.logging import get_correlation_id, get_logger
 from oura_mcp.models.audit import AuditAction, AuditEvent, CacheStatus
 from oura_mcp.models.dates import DateRange, resolve_range
@@ -64,17 +62,15 @@ class OuraFetch:
 class OuraService:
     def __init__(
         self,
-        client: BlockingOuraClient,
+        client: OuraApiClient,
         token_service: TokenService,
         cache: CacheService,
-        offloader: ThreadOffloader,
         audit: AuditService,
         config: Config,
     ) -> None:
         self._client = client
         self._tokens = token_service
         self._cache = cache
-        self._offloader = offloader
         self._audit = audit
         self._account_id = config.oura_account_id
         self._max_attempts = config.oura_max_attempts
@@ -163,8 +159,8 @@ class OuraService:
     async def _call(self, resource: Resource, operation, *, date_range: DateRange | None = None):
         """Run one blocking Oura operation with retries and error translation.
 
-        `operation` takes an access token and performs the call. It is invoked
-        on a worker thread, never on the event loop.
+        `operation` takes an access token and returns the awaitable that
+        performs the call.
         """
         started = time.perf_counter()
         refreshed = False
@@ -174,7 +170,7 @@ class OuraService:
             attempt += 1
             token = await self._tokens.get_access_token(self._account_id)
             try:
-                result = await self._offloader.run(operation, token)
+                result = await operation(token)
             except Exception as exc:  # noqa: BLE001 - translated immediately below
                 error = self._translate(exc, resource)
 
@@ -183,10 +179,19 @@ class OuraService:
                     # distributed lock and give the operation a single retry.
                     logger.info(
                         "oura rejected the access token; refreshing",
-                        extra={"resource": resource.value, "attempt": attempt},
+                        extra={
+                            "resource": resource.value, "attempt": attempt,
+                            "upstream_status": 401,
+                        },
                     )
                     refreshed = True
-                    await self._tokens.refresh(self._account_id)
+                    try:
+                        await self._tokens.refresh(self._account_id, rejected_access_token=token)
+                    except OuraError as refresh_error:
+                        await self._audit_request(
+                            resource, date_range, started, status="error", error=refresh_error
+                        )
+                        raise
                     continue
 
                 if self._should_retry(error, attempt):
@@ -204,6 +209,16 @@ class OuraService:
                     await asyncio.sleep(delay)
                     continue
 
+                logger.warning(
+                    "oura request failed after recovery attempts",
+                    extra={
+                        "resource": resource.value,
+                        "attempt": attempt,
+                        "refresh_attempted": refreshed,
+                        "upstream_status": error.upstream_status,
+                        "error_category": error.category,
+                    },
+                )
                 await self._audit_request(
                     resource, date_range, started, status="error", error=error
                 )
@@ -233,17 +248,18 @@ class OuraService:
         if isinstance(exc, OuraError):
             return exc
 
-        if isinstance(exc, requests.HTTPError) and exc.response is not None:
-            return self._translate_status(exc.response, resource)
+        if isinstance(exc, httpx2.HTTPStatusError):
+            error = self._translate_status(exc.response, resource)
+            error.upstream_status = exc.response.status_code
+            return error
 
-        if isinstance(exc, requests.Timeout):
+        if isinstance(exc, httpx2.TimeoutException):
             return OuraUpstreamError(f"The Oura API timed out fetching {resource.value}.")
 
-        if isinstance(exc, requests.ConnectionError):
+        if isinstance(exc, httpx2.TransportError):
             return OuraUpstreamError(f"Could not reach the Oura API to fetch {resource.value}.")
 
         if isinstance(exc, ValueError):
-            # Raised by oura-ring's own date validation, and by our resource map.
             return OuraValidationError(str(exc))
 
         logger.error(
@@ -253,7 +269,7 @@ class OuraService:
         )
         return OuraUpstreamError(f"Unexpected failure fetching {resource.value} from Oura.")
 
-    def _translate_status(self, response: requests.Response, resource: Resource) -> OuraError:
+    def _translate_status(self, response: httpx2.Response, resource: Resource) -> OuraError:
         status = response.status_code
         spec = spec_for(resource)
 
@@ -263,6 +279,18 @@ class OuraService:
                 "Check that the date range is valid and not in the future."
             )
         if status == 401:
+            # Oura answers 401 for a missing *scope*, not just an expired
+            # token, and says which one in the body:
+            #   {"detail": "Token is not authorized access stress scope."}
+            # Treating that as expiry would refresh and retry pointlessly, and
+            # tell the caller nothing useful, so split on the message.
+            if missing := _missing_scope(response):
+                return OuraPermissionError(
+                    f"Access to {resource.value} needs the '{missing}' Oura scope, which "
+                    "this connection was not granted. Add it to OURA_SCOPES and reconnect "
+                    "the account. Note that Oura does not list this scope in its OpenAPI "
+                    "spec, and returns 401 rather than 403 for it."
+                )
             return OuraAuthError(f"The Oura access token was rejected fetching {resource.value}.")
         if status == 403:
             return OuraPermissionError(
@@ -306,14 +334,32 @@ class OuraService:
                 start_date=date_range.start.isoformat() if date_range else None,
                 end_date=date_range.end.isoformat() if date_range else None,
                 duration_ms=round((time.perf_counter() - started) * 1000, 2),
-                upstream_status=error.status_code if error else 200,
+                upstream_status=error.upstream_status if error else 200,
                 error_category=error.category if error else None,
                 error_message=error.message if error else None,
             )
         )
 
 
-def _retry_after(response: requests.Response) -> float | None:
+def _missing_scope(response: httpx2.Response) -> str | None:
+    """Pull the scope name out of Oura's 401 body, if that is what it is.
+
+    Undocumented behaviour, so it is matched defensively: anything unexpected
+    just falls through and the 401 is treated as an expired token.
+    """
+    try:
+        detail = str(response.json().get("detail", ""))
+    except (ValueError, AttributeError):
+        return None
+
+    if "not authorized" not in detail or "scope" not in detail:
+        return None
+
+    words = detail.replace("scope.", "").replace("scope", "").split()
+    return words[-1] if words else None
+
+
+def _retry_after(response: httpx2.Response) -> float | None:
     """Read Oura's Retry-After header, ignoring anything unparseable."""
     raw = response.headers.get("Retry-After")
     if not raw:

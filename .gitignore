@@ -1,0 +1,4 @@
+oura-mcp/.env.example
+oura-mcp/.dockerignore
+oura-mcp/.env.example
+oura-mcp/values.prod.yaml

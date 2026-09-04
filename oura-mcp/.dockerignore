@@ -20,3 +20,4 @@ Dockerfile
 htmlcov
 .coverage
 scratchpad
+*.env.*

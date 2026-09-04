@@ -29,14 +29,20 @@ config:
   # The ingress hostname, no scheme. REQUIRED in production: the MCP
   # transport's DNS-rebinding protection rejects any Host header not on its
   # allowlist, and this is what populates it. Defaults to ingress.hostname.
-  publicHost: ""
+  publicHost: "oura.dan-leonard.com"
   logLevel: INFO
   mongodbDatabase: oura_mcp
   ouraAccountId: default
-  ouraScopes: "email personal daily heartrate workout tag session spo2"
+  # stress, heart_health and ring_configuration are undocumented but required
+  # by daily_resilience, cardiovascular age / VO2 max, and ring info.
+  ouraScopes: "email personal daily heartrate workout tag session spo2 stress heart_health ring_configuration"
   # Full callback URL registered on the Oura OAuth application.
-  ouraRedirectUri: ""
+  ouraRedirectUri: "https://oura.dan-leonard.com/oauth/callback"
   mcpPath: /mcp
+  # Extra Host values the MCP transport accepts, comma-separated. Needed
+  # when a reverse proxy rewrites Host -- e.g. routing /mcp through the
+  # api-gateway, which forwards to the cluster-internal service name.
+  mcpExtraAllowedHosts: "oura-mcp.oura.svc.cluster.local"
   # Stateless keeps no session state in a replica's memory, so no sticky
   # sessions are needed and any replica can serve any request.
   mcpStateless: true
@@ -51,7 +57,8 @@ config:
 #
 # The Secret must contain these keys:
 #   OURA_CLIENT_ID, OURA_CLIENT_SECRET, MCP_API_KEY, TOKEN_ENCRYPTION_KEY,
-#   MONGODB_URI, REDIS_URL, and optionally OURA_WEBHOOK_VERIFICATION_TOKEN.
+#   MONGODB_URI, REDIS_URL, and optionally OURA_WEBHOOK_VERIFICATION_TOKEN
+#   and MCP_OWNER_PASSWORD (the latter enables MCP OAuth).
 #
 # Alternatively set the values under `secrets` and the chart renders a Secret.
 # Anything left empty is omitted, so it can come from `existingSecret` instead.
@@ -69,6 +76,10 @@ secrets:
   mongodbUri: ""
   redisUrl: ""
   ouraWebhookVerificationToken: ""
+  # Set to enable MCP OAuth, which is what ChatGPT and other
+  # discovery-only clients require. Typed on the consent screen to approve
+  # an authorization; generate it like an API key, not a memorable password.
+  mcpOwnerPassword: ""
 
 # ── Probes ────────────────────────────────────────────────────────────────
 # /health is dependency-free so a Mongo or Redis blip cannot cause a restart
@@ -123,7 +134,7 @@ terminationGracePeriodSeconds: 30
 # ── Ingress ───────────────────────────────────────────────────────────────
 ingress:
   enabled: false
-  className: ""
+  className: nginx
   hostname: oura-mcp.example.com
   path: /
   pathType: Prefix
@@ -141,8 +152,16 @@ ingress:
   tls:
     enabled: false
     secretName: ""
-    # Set to issue a certificate automatically, e.g. letsencrypt-prod.
-    clusterIssuer: ""
+    # This cluster has no ClusterIssuers -- every namespace carries its own
+    # cert-manager Issuer, so the ingress is annotated `cert-manager.io/issuer`.
+    # A `cluster-issuer` annotation here would silently never issue a cert.
+    issuerName: letsencrypt-prod
+    # Create the Issuer as part of this release. Set false if the namespace
+    # already has one with this name.
+    createIssuer: true
+    email: ""
+    acmeServer: https://acme-v02.api.letsencrypt.org/directory
+    accountKeySecretName: letsencrypt-tls-prod
 
 autoscaling:
   enabled: false

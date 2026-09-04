@@ -14,7 +14,8 @@
     "    --header \"Authorization: Bearer $MCP_API_KEY\"",
     "",
     "Claude Desktop / Claude web: add it as a Custom Connector using the same",
-    "URL and header. ChatGPT: add it under Settings > Connectors > Custom.",
+    "URL and header. ChatGPT is NOT supported yet: its connector dialog only",
+    "offers OAuth or no auth, and this server uses a static bearer token.",
     "Any Streamable HTTP MCP client works; the transport and auth are standard."
   ],
   "mcpServers": {

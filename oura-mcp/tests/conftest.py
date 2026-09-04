@@ -9,19 +9,15 @@ silently against an over-permissive mock.
 from __future__ import annotations
 
 import asyncio
-import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-import requests
+import httpx2
 from cryptography.fernet import Fernet
 
 from oura_mcp.config import Config
 from oura_mcp.models.tokens import OuraToken, TokenGrant
-
-MAIN_THREAD = threading.get_ident()
-
 
 @pytest.fixture
 def config() -> Config:
@@ -41,26 +37,6 @@ def config() -> Config:
 
 # ── Fakes ─────────────────────────────────────────────────────────────────
 
-
-class FakeOffloader:
-    """Runs work on a real worker thread, and records that it did.
-
-    Using a real thread rather than calling inline is the point: it lets a test
-    assert that blocking Oura calls never execute on the event loop thread.
-    """
-
-    def __init__(self) -> None:
-        self.thread_ids: list[int] = []
-
-    async def run(self, func, /, *args, **kwargs):
-        def invoke():
-            self.thread_ids.append(threading.get_ident())
-            return func(*args, **kwargs)
-
-        return await asyncio.get_running_loop().run_in_executor(None, invoke)
-
-    def shutdown(self) -> None:  # pragma: no cover - parity with the real type
-        pass
 
 
 class FakeRedis:
@@ -210,13 +186,13 @@ class FakeOAuthClient:
             scope="daily personal",
         )
 
-    def refresh(self, refresh_token: str) -> TokenGrant:
+    async def refresh(self, refresh_token: str) -> TokenGrant:
         if self.error:
             raise self.error
         self.refresh_calls.append(refresh_token)
         return self._next_grant()
 
-    def exchange_code(self, code: str) -> TokenGrant:
+    async def exchange_code(self, code: str) -> TokenGrant:
         if self.error:
             raise self.error
         self.exchange_calls.append(code)
@@ -247,17 +223,21 @@ def make_token(
     )
 
 
-def http_error(status: int, headers: dict[str, str] | None = None) -> requests.HTTPError:
-    """Build the exception `oura-ring` raises via `raise_for_status()`."""
-    response = requests.Response()
-    response.status_code = status
-    response.headers.update(headers or {})
-    return requests.HTTPError(f"{status} error", response=response)
-
-
-@pytest.fixture
-def offloader() -> FakeOffloader:
-    return FakeOffloader()
+def http_error(
+    status: int,
+    headers: dict[str, str] | None = None,
+    json_body: dict | None = None,
+) -> httpx2.HTTPStatusError:
+    """Build the exception the client raises via `raise_for_status()`."""
+    response = httpx2.Response(
+        status,
+        headers=headers or {},
+        json=json_body if json_body is not None else {},
+        request=httpx2.Request("GET", "https://api.ouraring.com/v2/usercollection/x"),
+    )
+    return httpx2.HTTPStatusError(
+        f"{status} error", request=response.request, response=response
+    )
 
 
 @pytest.fixture

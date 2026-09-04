@@ -8,7 +8,7 @@ below is what makes that impossible:
 1.  Take a Redis lock scoped to the account.
 2.  Re-read the persisted token, because another replica may have refreshed
     while we waited.
-3.  If it is now valid, use it and refresh nothing.
+3.  If it is now valid and was not rejected by Oura, use it and refresh nothing.
 4.  Otherwise call Oura, and persist the new access *and* refresh token in a
     single atomic update before releasing the lock.
 
@@ -23,7 +23,6 @@ from redis.exceptions import LockError, RedisError
 
 from oura_mcp.clients.oauth_client import OuraOAuthClient
 from oura_mcp.config import Config
-from oura_mcp.infrastructure.executor import ThreadOffloader
 from oura_mcp.infrastructure.logging import get_correlation_id, get_logger
 from oura_mcp.models.audit import AuditAction, AuditEvent
 from oura_mcp.models.errors import (
@@ -46,14 +45,12 @@ class TokenService:
         repository: TokenRepository,
         oauth_client: OuraOAuthClient,
         redis: Redis,
-        offloader: ThreadOffloader,
         audit: AuditService,
         config: Config,
     ) -> None:
         self._repository = repository
         self._oauth = oauth_client
         self._redis = redis
-        self._offloader = offloader
         self._audit = audit
         self._skew = config.token_expiry_skew_seconds
         # The lock TTL is the ceiling on how long a crashed or wedged replica
@@ -90,12 +87,20 @@ class TokenService:
         )
         return stored
 
-    async def refresh(self, account_id: str, *, seen_version: int | None = None) -> OuraToken:
+    async def refresh(
+        self, account_id: str, *, seen_version: int | None = None,
+        rejected_access_token: str | None = None,
+    ) -> OuraToken:
         """Rotate the token pair under a distributed lock.
 
         `seen_version` is the version the caller was working from. If the stored
         version has moved on, another replica already rotated and that result is
         returned instead of burning another refresh token.
+
+        `rejected_access_token` forces rotation of that specific token after a
+        401, even if its recorded expiry is in the future. A different valid
+        token found under the lock is reused; concurrent 401s cannot rotate it
+        repeatedly. The rejected credential must never be logged.
         """
         try:
             lock = self._redis.lock(
@@ -122,7 +127,7 @@ class TokenService:
             )
 
         try:
-            return await self._refresh_locked(account_id, seen_version)
+            return await self._refresh_locked(account_id, seen_version, rejected_access_token)
         finally:
             try:
                 await lock.release()
@@ -134,12 +139,18 @@ class TokenService:
                     extra={"account_id": account_id},
                 )
 
-    async def _refresh_locked(self, account_id: str, seen_version: int | None) -> OuraToken:
+    async def _refresh_locked(
+        self, account_id: str, seen_version: int | None,
+        rejected_access_token: str | None = None,
+    ) -> OuraToken:
         # Step 2: re-read under the lock. Another replica may have done the work
         # while we were queued behind it.
         current = await self._require_token(account_id)
 
-        if seen_version is not None and current.version != seen_version:
+        if rejected_access_token is not None:
+            if current.access_token != rejected_access_token and not current.is_expired(skew_seconds=self._skew):
+                return current
+        elif seen_version is not None and current.version != seen_version:
             if not current.is_expired(skew_seconds=self._skew):
                 logger.info(
                     "token already refreshed by another replica",
@@ -149,7 +160,7 @@ class TokenService:
         elif not current.is_expired(skew_seconds=self._skew):
             return current
 
-        grant = await self._offloader.run(self._oauth.refresh, current.refresh_token)
+        grant = await self._oauth.refresh(current.refresh_token)
 
         # Step 5: both halves land in one atomic update. A reader can never see
         # the new access token paired with the dead refresh token.

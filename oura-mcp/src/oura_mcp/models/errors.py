@@ -16,6 +16,8 @@ class OuraError(Exception):
     """
 
     status_code: int | None = None
+    # Actual Oura HTTP response, separate from our translated response status.
+    upstream_status: int | None = None
 
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
         super().__init__(message)

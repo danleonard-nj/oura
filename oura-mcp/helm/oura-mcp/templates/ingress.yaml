@@ -10,8 +10,11 @@ metadata:
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.clusterIssuer }}
-    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.clusterIssuer | quote }}
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/issuer: {{ .Values.ingress.tls.issuerName | quote }}
+    {{- end }}
+    {{- with .Values.ingress.className }}
+    kubernetes.io/ingress.class: {{ . | quote }}
     {{- end }}
 spec:
   {{- with .Values.ingress.className }}

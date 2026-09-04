@@ -2,13 +2,14 @@
 
 A Model Context Protocol server that exposes your Oura Ring data, read-only,
 over Streamable HTTP. Deploy it behind a Kubernetes ingress and any MCP client
-— Claude Code, Claude Desktop, ChatGPT, or anything else that speaks the
-protocol — can ask questions about your sleep, readiness, activity, stress and
-workouts.
+— Claude Code, ChatGPT, or anything else that speaks the protocol — can
+ask questions about your sleep, readiness, activity, stress and workouts.
+Clients that only offer OAuth, such as ChatGPT, are supported too --
+see [MCP OAuth](#mcp-oauth).
 
 ```
-you ──▶ Claude / ChatGPT ──▶ https://oura.example.com/mcp ──▶ Oura API v2
-                                    (this service)
+MCP client ──▶ https://oura.example.com/mcp ──▶ Oura API v2
+                     (this service)
 ```
 
 ---
@@ -16,7 +17,7 @@ you ──▶ Claude / ChatGPT ──▶ https://oura.example.com/mcp ──▶ 
 ## Contents
 
 1. [Architecture](#architecture)
-2. [Why `oura-ring`](#why-oura-ring)
+2. [The Oura client](#the-oura-client)
 3. [Local setup](#local-setup)
 4. [Registering an Oura OAuth application](#registering-an-oura-oauth-application)
 5. [Scopes](#scopes)
@@ -33,36 +34,46 @@ you ──▶ Claude / ChatGPT ──▶ https://oura.example.com/mcp ──▶ 
 16. [Token refresh and rotation](#token-refresh-and-rotation)
 17. [Testing](#testing)
 18. [Security](#security)
-19. [Limitations](#limitations)
+19. [MCP OAuth](#mcp-oauth)
+20. [Limitations](#limitations)
 
 ---
 
 ## Architecture
 
 One Starlette application serves everything. There is no second web framework:
-the MCP SDK already brings Starlette, the HTTP surface is eight routes, and a
-single app means a single lifespan with no cross-framework bridging.
+the MCP SDK already brings Starlette, the HTTP surface is small, and a single
+app means a single lifespan with no cross-framework bridging.
 
-| Path | Served by | Auth |
-| --- | --- | --- |
-| `/mcp` | Official MCP Streamable HTTP app | `Authorization: Bearer $MCP_API_KEY` |
-| `/health` | Liveness | none |
-| `/ready` | Readiness | none |
-| `/oauth/authorize`, `/oauth/callback` | OAuth2 flow | OAuth `state` nonce |
-| `/webhooks/oura` | Oura webhooks | Oura challenge + HMAC signature |
-| `/api/*` | Admin status, audit, webhook history | `Authorization: Bearer $MCP_API_KEY` |
+| Path                                           | Served by                                  | Auth                                       |
+| ---------------------------------------------- | ------------------------------------------ | ------------------------------------------ |
+| `/mcp`                                         | Official MCP Streamable HTTP app           | `MCP_API_KEY` **or** an OAuth access token |
+| `/health`                                      | Liveness                                   | none                                       |
+| `/ready`                                       | Readiness                                  | none                                       |
+| `/oauth/authorize`, `/oauth/callback`          | Our OAuth2 flow **as a client of Oura**    | `state` nonce                              |
+| `/authorize`, `/token`, `/register`, `/revoke` | Us **as an OAuth2 server** for MCP clients | PKCE, DCR, consent                         |
+| `/.well-known/oauth-*`                         | OAuth discovery metadata                   | none (public by design)                    |
+| `/consent`                                     | Approval screen for an MCP authorization   | `MCP_OWNER_PASSWORD`                       |
+| `/webhooks/oura`                               | Oura webhooks                              | Oura challenge + HMAC signature            |
+| `/api/*`                                       | Admin status, audit, webhook subscriptions | `Authorization: Bearer $MCP_API_KEY`       |
+
+Two OAuth roles coexist and are easy to confuse. Under `/oauth/*` we are a
+_client_ of Oura, holding a token for your ring data. At the root
+(`/authorize`, `/token`, ...) we are a _server_, issuing tokens to MCP clients.
+The prefixes keep them apart; only the latter appears when
+`MCP_OWNER_PASSWORD` is set.
 
 ```
 src/oura_mcp/
   app.py              ASGI composition root, lifespan, route table
   config.py           typed configuration, validated at startup
   container.py        DEPI composition root — every registration lives here
-  api/                thin route handlers, auth middleware, correlation ids
+  api/                thin route handlers, auth middleware, consent screen
   mcp/                MCP server construction and the tool surface
   services/           all business and integration logic
-  repositories/       Mongo persistence
-  clients/            blocking Oura HTTP clients
-  infrastructure/     logging, crypto, Mongo, Redis, the thread pool
+  repositories/       Mongo persistence (tokens, audit, webhooks, oauth)
+  clients/            async Oura HTTP clients (httpx2)
+  infrastructure/     logging, crypto, Mongo, Redis
   models/             domain types, date validation, result shapes
 ```
 
@@ -92,17 +103,18 @@ them; building at import time binds them to a throwaway loop.
 ```
 tools/call
   └─ tool fn (thin)          resolve range → call service → return typed model
-     └─ OuraService          cache lookup → token → offload → translate errors
+     └─ OuraService          cache lookup → token → await → translate errors
         ├─ CacheService      Redis, generation-counter invalidation
         ├─ TokenService      Redis lock → re-read → refresh → atomic persist
-        └─ ThreadOffloader   bounded pool; oura-ring is synchronous
+        └─ OuraApiClient     httpx2, pooled and shared across the app
      └─ AuditService         Mongo row + structured stdout, never fatal
 ```
 
 ### What is stored where
 
-**Mongo** holds durable operational data only: `oauth_tokens` (encrypted),
-`audit_events` and `webhook_events`.
+**Mongo** holds durable operational data only: `oauth_tokens` (your encrypted
+Oura tokens), `audit_events`, `webhook_events`, plus `oauth_clients` and
+`oauth_refresh_tokens` when MCP OAuth is on.
 
 **Health data is deliberately not copied into Mongo.** Oura is the system of
 record, Redis already absorbs repeat reads, and webhooks keep that cache
@@ -111,52 +123,47 @@ and a pile of personal health information at rest, in exchange for nothing this
 service needs. If `oura-sync` later wants a local historical store, that is a
 separate concern with its own schema and its own justification.
 
-**Redis** does three jobs: the distributed OAuth refresh lock (mandatory),
-response caching (optional), and webhook deduplication (optional). Only the
-lock is required for correctness.
+**Redis** does four jobs: the distributed Oura-token refresh lock (mandatory),
+response caching (optional), webhook deduplication (optional), and the
+short-lived halves of MCP OAuth — pending authorizations, authorization codes
+and access tokens. Only the refresh lock is required for correctness.
 
 ---
 
-## Why `oura-ring`
+## The Oura client
 
-[`hedgertronic/oura-ring`](https://github.com/hedgertronic/oura-ring) is a
-small, readable client that covers most of Oura's v2 collections, follows
-`next_token` pagination properly, and has no heavy dependencies. Using it means
-not maintaining a hand-rolled HTTP client for fifteen endpoints.
+Written directly on `httpx2`, the same async client the MCP SDK already brings.
+Every Oura collection is the same shape -- `GET /v2/usercollection/{segment}`
+with `start_date`/`end_date` and `next_token` pagination -- so the whole API
+surface is one map plus one pagination loop, about eighty lines in
+`clients/oura_client.py`.
 
-It is **synchronous**, built on `requests`. Calling it from a coroutine would
-block the event loop for an entire Oura round trip and stall every other MCP
-session on the replica. Every call therefore goes through
-`infrastructure/executor.py`, a bounded `ThreadPoolExecutor`. Bounded rather
-than `asyncio.to_thread` on purpose: the default executor is unbounded, and
-Oura enforces per-token and per-application rate limits, so a hard ceiling on
-concurrent upstream requests is the useful behaviour.
+It previously used [`hedgertronic/oura-ring`](https://github.com/hedgertronic/oura-ring),
+which was dropped because it is built on synchronous `requests`. That cost:
 
-That detail is confined to `clients/oura_client.py` and the offloader. Nothing
-in the MCP tools knows the client is synchronous, so replacing it with a native
-async client later means deleting an indirection, not rewriting callers. There
-is a test asserting no Oura call ever executes on the event-loop thread.
+- a `ThreadPoolExecutor` to keep blocking calls off the event loop, plus
+  thread-confined session handling so a token refresh could not race a request;
+- four collections it does not implement (`daily_resilience`,
+  `daily_cardiovascular_age`, `vO2_max`, `ring_battery_level`), already
+  hand-rolled alongside it;
+- no access to the `Response`, since it calls `raise_for_status()` internally --
+  so rate-limit headers had to be recovered from the exception.
 
-### Where the library falls short
+All of that is gone. One pooled `AsyncClient` is a DI singleton, so connection
+reuse and the connection ceiling apply across the whole application instead of
+per worker thread. `OURA_EXECUTOR_WORKERS` survives as the `max_connections`
+limit -- Oura rate-limits per token and per application, so a ceiling on
+concurrent upstream requests is still the useful behaviour, just without the
+threads.
 
-Four collections exist in Oura's published OpenAPI spec but are absent from
-`oura-ring` 0.3.0:
+Errors reach `OuraService` as `httpx2.HTTPStatusError` (or a transport error)
+and are translated there, which keeps this module a pure transport concern.
 
-| Collection | Exposed as |
-| --- | --- |
-| `daily_resilience` | `oura_resilience` |
-| `daily_cardiovascular_age` | `oura_cardiovascular_age` |
-| `vO2_max` | `oura_vo2_max` |
-| `ring_battery_level` | `oura_query` |
+### VO2 max is spelled two ways
 
-These are issued directly in `clients/oura_client.py` through the library's own
-authenticated session, reusing its connection pool and pagination shape. The
-webhook subscription routes (`/v2/webhook/subscription`) are likewise absent
-and live in `WebhookSubscriptionClient`. Nothing else is hand-rolled.
-
-One further gap: `oura-ring` calls `raise_for_status()` and returns parsed
-JSON, so the `Response` never reaches the caller. Rate-limit headers are
-recovered from `requests.HTTPError.response` in the translation layer.
+The collection path is `vO2_max`; the webhook `data_type` for the same data is
+`vo2_max`. Both spellings are in the codebase deliberately -- `RESOURCE_PATHS`
+holds the former, `WEBHOOK_DATA_TYPE_RESOURCES` the latter.
 
 ---
 
@@ -215,7 +222,7 @@ Two things worth knowing:
 
 | Scope | Grants | Tools |
 | --- | --- | --- |
-| `daily` | Sleep, readiness, activity, stress, resilience, cardiovascular age, VO2 max | `oura_summary`, `oura_sleep`, `oura_readiness`, `oura_activity`, `oura_stress`, `oura_resilience`, `oura_cardiovascular_age`, `oura_vo2_max` |
+| `daily` | Sleep, readiness, activity, stress | `oura_summary`, `oura_sleep`, `oura_readiness`, `oura_activity`, `oura_stress` |
 | `heartrate` | Heart rate time series | `oura_heart_rate` |
 | `workout` | Workouts | `oura_workouts` |
 | `session` | Guided and unguided sessions | `oura_sessions` |
@@ -223,10 +230,35 @@ Two things worth knowing:
 | `spo2` | Blood oxygen during sleep | `oura_spo2` |
 | `personal` | Age, sex, height, weight | `oura_personal_info` |
 | `email` | Email address | — |
+| **`stress`** | Resilience | `oura_resilience` |
+| **`heart_health`** | Cardiovascular age, VO2 max | `oura_cardiovascular_age`, `oura_vo2_max` |
+| **`ring_configuration`** | Ring model, firmware, battery | `oura_ring_info` |
 
 Default: all of them. Users can deselect scopes individually at the consent
-screen, so `oura-auth` reports what was actually granted. A missing scope
-surfaces as a readable permission error naming the scope, not a crash.
+screen, so `oura-auth` reports what was actually granted.
+
+### Three of these are undocumented
+
+The last three appear **nowhere in Oura's OpenAPI spec**, which advertises only
+`email personal daily heartrate workout tag session spo2Daily`. They are real
+and required, and Oura signals a missing one with **`401`, not `403`**:
+
+```json
+{ "detail": "Token is not authorized access stress scope." }
+```
+
+That matters twice over. A `401` normally means an expired token, so without
+special handling the service would refresh and retry on every call to an
+endpoint it can never reach. `OuraService` therefore inspects the body and
+turns a scope-shaped `401` into a permission error naming the scope — no
+refresh, no retry, and a message that says what to do.
+
+If an account was connected before these were added to `OURA_SCOPES`, four
+tools return a permission error until it reconnects. Check what was granted:
+
+```bash
+curl -s -H "Authorization: Bearer $MCP_API_KEY"   https://oura.dan-leonard.com/api/status | jq .scopes
+```
 
 ---
 
@@ -261,29 +293,29 @@ the API nor any MCP tool ever returns token material.
 
 Required — the process refuses to start without them, naming what is missing:
 
-| Variable | Purpose |
-| --- | --- |
-| `OURA_CLIENT_ID` | OAuth application client id |
-| `OURA_CLIENT_SECRET` | OAuth client secret; also the webhook HMAC key |
-| `OURA_REDIRECT_URI` | Must match the Oura application exactly |
-| `MCP_API_KEY` | Bearer token for `/mcp` and `/api/*` |
-| `TOKEN_ENCRYPTION_KEY` | Fernet key; urlsafe base64, 32 bytes |
-| `MONGODB_URI` | Existing cluster |
-| `REDIS_URL` | Existing instance |
+| Variable               | Purpose                                        |
+| ---------------------- | ---------------------------------------------- |
+| `OURA_CLIENT_ID`       | OAuth application client id                    |
+| `OURA_CLIENT_SECRET`   | OAuth client secret; also the webhook HMAC key |
+| `OURA_REDIRECT_URI`    | Must match the Oura application exactly        |
+| `MCP_API_KEY`          | Bearer token for `/mcp` and `/api/*`           |
+| `TOKEN_ENCRYPTION_KEY` | Fernet key; urlsafe base64, 32 bytes           |
+| `MONGODB_URI`          | Existing cluster                               |
+| `REDIS_URL`            | Existing instance                              |
 
 Important optional ones:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `PUBLIC_HOST` | — | Ingress hostname, no scheme. **Required in production**; see [Ingress](#ingress-considerations). |
-| `MONGODB_DATABASE` | `oura_mcp` | |
-| `OURA_SCOPES` | all read scopes | Space-separated |
-| `OURA_ACCOUNT_ID` | `default` | Namespaces tokens, cache keys, locks, audit |
-| `MCP_STATELESS` | `true` | Stateless transport; no sticky sessions |
-| `MCP_PATH` | `/mcp` | |
-| `OURA_WEBHOOK_VERIFICATION_TOKEN` | — | Required to accept webhook subscriptions |
-| `LOG_LEVEL` | `INFO` | |
-| `HOST` / `PORT` | `0.0.0.0` / `8000` | |
+| Variable                          | Default            | Purpose                                                                                          |
+| --------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------ |
+| `PUBLIC_HOST`                     | —                  | Ingress hostname, no scheme. **Required in production**; see [Ingress](#ingress-considerations). |
+| `MONGODB_DATABASE`                | `oura_mcp`         |                                                                                                  |
+| `OURA_SCOPES`                     | all read scopes    | Space-separated                                                                                  |
+| `OURA_ACCOUNT_ID`                 | `default`          | Namespaces tokens, cache keys, locks, audit                                                      |
+| `MCP_STATELESS`                   | `true`             | Stateless transport; no sticky sessions                                                          |
+| `MCP_PATH`                        | `/mcp`             |                                                                                                  |
+| `OURA_WEBHOOK_VERIFICATION_TOKEN` | —                  | Required to accept webhook subscriptions                                                         |
+| `LOG_LEVEL`                       | `INFO`             |                                                                                                  |
+| `HOST` / `PORT`                   | `0.0.0.0` / `8000` |                                                                                                  |
 
 Tuning knobs (executor size, timeouts, retry budget, range caps, cache TTLs,
 lock timings) are listed with their defaults in `.env.example`.
@@ -354,9 +386,11 @@ copy; `mcp.json` is gitignored so a filled-in one never gets committed):
 **Claude Desktop / Claude web** — add it as a Custom Connector with the same
 URL and header.
 
-**ChatGPT** — Settings → Connectors → Custom, same URL and header. Note that
-ChatGPT's deep-research connectors expect `search`/`fetch` tools specifically;
-this server exposes Oura tools instead, so use it as a general connector.
+**ChatGPT** — Settings → Connectors → Custom. Its dialog offers only _OAuth_
+or _no auth_, with no field for a static header, so set `MCP_OWNER_PASSWORD`
+and choose **OAuth**; the server handles discovery and registration itself.
+Enter `https://oura.dan-leonard.com/mcp` as the server URL. See
+[MCP OAuth](#mcp-oauth).
 
 Check it end to end:
 
@@ -377,24 +411,24 @@ curl -sS https://oura.example.com/mcp \
 Sixteen tools, all read-only. There are no write operations to Oura anywhere in
 the MCP surface.
 
-| Tool | Returns | Default range |
-| --- | --- | --- |
-| `oura_summary` | Sleep + readiness + activity + stress + resilience + SpO2 + workouts, joined by day | 7 days |
-| `oura_sleep` | Daily sleep summaries and scores | 7 days |
-| `oura_readiness` | Daily readiness scores and contributors | 7 days |
-| `oura_activity` | Steps, calories, MET minutes, activity score | 7 days |
-| `oura_stress` | High-stress vs recovery minutes | 7 days |
-| `oura_spo2` | Blood oxygen during sleep | 7 days |
-| `oura_resilience` | Resilience level and contributors | 14 days |
-| `oura_cardiovascular_age` | Estimated vascular age | 30 days |
-| `oura_vo2_max` | VO2 max readings | 90 days |
-| `oura_heart_rate` | Heart rate samples | 1 day (max 14) |
-| `oura_workouts` | Workouts | 14 days |
-| `oura_sessions` | Meditation, breathing, naps | 14 days |
-| `oura_tags` | User-entered tags | 14 days |
-| `oura_ring_info` | Ring model, size, firmware | 30 days |
-| `oura_personal_info` | Age, sex, height, weight | — |
-| `oura_query` | Any collection by name, for the long tail | 7 days |
+| Tool                      | Returns                                                                             | Default range  |
+| ------------------------- | ----------------------------------------------------------------------------------- | -------------- |
+| `oura_summary`            | Sleep + readiness + activity + stress + resilience + SpO2 + workouts, joined by day | 7 days         |
+| `oura_sleep`              | Daily sleep summaries and scores                                                    | 7 days         |
+| `oura_readiness`          | Daily readiness scores and contributors                                             | 7 days         |
+| `oura_activity`           | Steps, calories, MET minutes, activity score                                        | 7 days         |
+| `oura_stress`             | High-stress vs recovery minutes                                                     | 7 days         |
+| `oura_spo2`               | Blood oxygen during sleep                                                           | 7 days         |
+| `oura_resilience`         | Resilience level and contributors                                                   | 14 days        |
+| `oura_cardiovascular_age` | Estimated vascular age                                                              | 30 days        |
+| `oura_vo2_max`            | VO2 max readings                                                                    | 90 days        |
+| `oura_heart_rate`         | Heart rate samples                                                                  | 1 day (max 14) |
+| `oura_workouts`           | Workouts                                                                            | 14 days        |
+| `oura_sessions`           | Meditation, breathing, naps                                                         | 14 days        |
+| `oura_tags`               | User-entered tags                                                                   | 14 days        |
+| `oura_ring_info`          | Ring model, size, firmware                                                          | 30 days        |
+| `oura_personal_info`      | Age, sex, height, weight                                                            | —              |
+| `oura_query`              | Any collection by name, for the long tail                                           | 7 days         |
 
 `oura_summary` is the one to reach for first: it fans out across six
 collections concurrently and joins them on the calendar day, so "how did I
@@ -475,6 +509,10 @@ helm upgrade --install oura-mcp ./helm/oura-mcp \
   --set ingress.tls.clusterIssuer=letsencrypt-prod
 ```
 
+Or just run `deploy.bat`, which tags the image with a timestamp plus the short
+commit hash, pushes both that tag and `latest`, and upgrades the release in the
+`oura` namespace using `values.prod.yaml`.
+
 Dry run first:
 
 ```bash
@@ -493,6 +531,40 @@ helm rollback oura-mcp
 `maxUnavailable: 0`, liveness on `/health`, readiness on `/ready`, resource
 requests and limits, pod and container security contexts, and an optional HPA
 and PodDisruptionBudget are all in `values.yaml`.
+
+### api-gateway
+
+The admin endpoints are also mapped through the shared gateway
+(`api-gateway/services/gateway/mapping/oura-mcp.json`) under `/api/oura/*`, so
+`https://api.dan-leonard.com/api/oura/status` works alongside the other
+services. The gateway forwards request headers, so `MCP_API_KEY` still applies
+end to end. Mappings are discovered with `os.listdir('mapping')` — dropping the
+file in is the whole registration.
+
+`/mcp` is mapped too, at `/api/oura/mcp`, and marked `"streaming": true`. The
+gateway proxy buffers by default — it awaited the whole upstream response and
+returned `service_response.content` — which would have stalled every tool call
+until it completed and broken incremental SSE delivery. It now supports
+opt-in streaming per route; see that repo's notes on the flag.
+
+Because the gateway rewrites `Host` to the cluster-internal service name, that
+name has to be on this service's DNS-rebinding allowlist:
+
+```yaml
+config:
+  mcpExtraAllowedHosts: oura-mcp.oura.svc.cluster.local
+```
+
+Without it the transport answers `421`. `values.prod.yaml` sets it.
+
+Either address works for clients — `https://oura.dan-leonard.com/mcp` direct,
+or `https://api.dan-leonard.com/api/oura/mcp` through the gateway. The direct
+host is one hop shorter; the gateway route keeps everything behind one
+hostname.
+
+`/webhooks/oura` and `/oauth/*` stay unmapped, for different reasons: the
+webhook signature is an HMAC over the exact request bytes, and the OAuth
+redirect URI is registered with Oura against the service's own hostname.
 
 ### Scaling
 
@@ -516,17 +588,49 @@ Create the Secret out of band and point the chart at it with `existingSecret`.
 The chart can render its own from inline values, but those end up in the Helm
 release history in plain text.
 
+The simplest route is an env file:
+
 ```bash
-kubectl create secret generic oura-mcp \
-  --namespace default \
-  --from-literal=OURA_CLIENT_ID='...' \
-  --from-literal=OURA_CLIENT_SECRET='...' \
-  --from-literal=MCP_API_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(48))')" \
-  --from-literal=TOKEN_ENCRYPTION_KEY="$(python -c 'from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())')" \
-  --from-literal=MONGODB_URI='mongodb://user:pass@mongo-internal.default.svc.cluster.local:27017/?authSource=admin' \
-  --from-literal=REDIS_URL='redis://redis-internal.default.svc.cluster.local:6379/0' \
-  --from-literal=OURA_WEBHOOK_VERIFICATION_TOKEN="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+cp .env.prod.example .env.prod    # then fill it in
+push-secret.bat                   # validate, create the Secret, restart the pods
+push-secret.bat --overwrite       # validate, update the Secret, restart the pods
 ```
+
+`.env.prod` is gitignored. The script validates before pushing, because
+`kubectl create secret --from-env-file` has two behaviours that fail silently:
+
+- **Quotes are not stripped.** `TOKEN_ENCRYPTION_KEY="abc..."` stores the
+  quotes as part of the value, and Fernet rejects the key at startup.
+- **Trailing whitespace is preserved.** A stray space after `MCP_API_KEY`
+  means every request 401s, with nothing in the logs to explain it.
+
+It also rejects ConfigMap keys such as `PUBLIC_HOST`. The deployment lists the
+Secret _after_ the ConfigMap in `envFrom`, so anything in this file silently
+overrides the chart, and a stale `PUBLIC_HOST` would quietly break OAuth
+discovery. Keep the file to secrets only.
+
+Run the check alone at any time:
+
+```bash
+python scripts/validate_env_file.py .env.prod
+```
+
+Or use explicit flags instead, if you prefer:
+
+```bash
+kubectl create secret generic oura-mcp   --namespace oura   --from-literal=OURA_CLIENT_ID='...'   --from-literal=OURA_CLIENT_SECRET='...'   --from-literal=MCP_API_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(48))')"   --from-literal=TOKEN_ENCRYPTION_KEY="$(python -c 'from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())')"   --from-literal=MONGODB_URI='mongodb://user:pass@mongo-internal.default.svc.cluster.local:27017/?authSource=admin'   --from-literal=REDIS_URL='redis://redis-internal.default.svc.cluster.local:6379/0'   --from-literal=OURA_WEBHOOK_VERIFICATION_TOKEN="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"   --from-literal=MCP_OWNER_PASSWORD="$(python -c 'import secrets;print(secrets.token_urlsafe(48))')"
+```
+
+`MCP_OWNER_PASSWORD` is optional: omit it and the server runs bearer-token
+only. Include it to enable [MCP OAuth](#mcp-oauth), which is what ChatGPT
+needs. Read it back when you need it at the consent screen:
+
+```bash
+kubectl get secret oura-mcp -n oura -o jsonpath='{.data.MCP_OWNER_PASSWORD}' | base64 -d
+```
+
+A Secret change on its own restarts nothing — `envFrom` values are read at
+container start. `push-secret.bat` does the rollout restart for you.
 
 **Keep `TOKEN_ENCRYPTION_KEY` safe.** Rotating it makes every stored token
 undecryptable and the account has to reconnect. The service says exactly that
@@ -551,11 +655,11 @@ for another controller:
 **ingress-nginx** (chart default)
 
 ```yaml
-nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-nginx.ingress.kubernetes.io/proxy-buffering: "off"
-nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
-nginx.ingress.kubernetes.io/proxy-body-size: "4m"
+nginx.ingress.kubernetes.io/proxy-read-timeout: '3600'
+nginx.ingress.kubernetes.io/proxy-send-timeout: '3600'
+nginx.ingress.kubernetes.io/proxy-buffering: 'off'
+nginx.ingress.kubernetes.io/proxy-request-buffering: 'off'
+nginx.ingress.kubernetes.io/proxy-body-size: '4m'
 ```
 
 **Traefik** — set `respondingTimeouts.readTimeout` on the entrypoint and use a
@@ -570,7 +674,32 @@ the backend idle/response timeout; the common 30–60s default is too low.
 `PUBLIC_HOST` must be set to the ingress hostname. The MCP SDK's DNS-rebinding
 protection validates the `Host` header against an allowlist and defaults to
 localhost only; without `PUBLIC_HOST` every production request gets a `421`.
-The chart derives it from `ingress.hostname` automatically.
+The chart derives it from `ingress.hostname` automatically. `PUBLIC_SCHEME`
+follows `ingress.tls.enabled` and is what OAuth metadata URLs are built from.
+
+### TLS
+
+This cluster has **no ClusterIssuers** — each namespace carries its own
+cert-manager `Issuer` named `letsencrypt-prod`, and ingresses are annotated
+`cert-manager.io/issuer`, not `cert-manager.io/cluster-issuer`. A
+`cluster-issuer` annotation here fails silently: the Certificate is created and
+simply never becomes ready.
+
+The chart therefore renders the namespaced Issuer itself, matching the existing
+ones (ACME v2 production, HTTP-01 solver over the `nginx` class):
+
+```yaml
+ingress:
+  className: nginx
+  tls:
+    enabled: true
+    issuerName: letsencrypt-prod
+    createIssuer: true # false if the namespace already has one
+    email: you@example.com
+```
+
+Ingresses in this cluster carry both `ingressClassName: nginx` and the legacy
+`kubernetes.io/ingress.class` annotation; the chart emits both.
 
 ---
 
@@ -626,7 +755,7 @@ curl -sX DELETE -H "Authorization: Bearer $MCP_API_KEY" \
 ```
 
 These are administrative HTTP endpoints, not MCP tools, and they write only to
-Oura's *subscription* resource — never to health data. The MCP surface stays
+Oura's _subscription_ resource — never to health data. The MCP surface stays
 read-only.
 
 **Subscriptions expire.** Each carries an `expiration_time`, and Oura stops
@@ -693,15 +822,15 @@ Oura. There is a test for that, and for the Redis-outage path.
 
 ### Upstream error handling
 
-| Upstream | Behaviour |
-| --- | --- |
-| 400 | `OuraValidationError`, no retry |
-| 401 | Refresh under lock, retry **once** |
-| 403 | `OuraPermissionError` naming the required scope, no retry |
-| 404 | `OuraNotFoundError`, no retry |
-| 429 | Retry honouring `Retry-After`, within the attempt budget |
-| 5xx | Exponential backoff with jitter, capped at 8s |
-| Timeout / connection | Same as 5xx |
+| Upstream             | Behaviour                                                 |
+| -------------------- | --------------------------------------------------------- |
+| 400                  | `OuraValidationError`, no retry                           |
+| 401                  | Refresh under lock, retry **once**                        |
+| 403                  | `OuraPermissionError` naming the required scope, no retry |
+| 404                  | `OuraNotFoundError`, no retry                             |
+| 429                  | Retry honouring `Retry-After`, within the attempt budget  |
+| 5xx                  | Exponential backoff with jitter, capped at 8s             |
+| Timeout / connection | Same as 5xx                                               |
 
 Bounded at `OURA_MAX_ATTEMPTS` (default 3). Nothing retries indefinitely.
 Errors are translated into caller-safe messages — no tokens, no headers, no
@@ -737,11 +866,10 @@ readiness behaviour.
 
 ## Security
 
-- **`/mcp` requires a bearer token**, compared with `hmac.compare_digest`. The
-  middleware wraps only the MCP app, so health probes, the OAuth callback and
-  the webhook keep their own verification models. It is one self-contained
-  class — swapping in standards-based MCP OAuth later means replacing it with
-  the SDK's `token_verifier` and touching nothing else.
+- **`/mcp` requires a bearer credential** — either `MCP_API_KEY`, compared
+  with `hmac.compare_digest`, or an OAuth access token this server issued. The
+  middleware wraps only the MCP app, so health probes, the Oura OAuth callback
+  and the webhook keep their own verification models.
 - **Health endpoints are unauthenticated** so probes work; they expose no data.
 - **`/api/*` requires the same bearer token.**
 - **Tokens are encrypted at rest** with Fernet, and never returned by any
@@ -761,8 +889,100 @@ readiness behaviour.
 
 ---
 
+## MCP OAuth
+
+The `/mcp` endpoint accepts **either** credential:
+
+| Credential                                  | For                                             |
+| ------------------------------------------- | ----------------------------------------------- |
+| `Authorization: Bearer $MCP_API_KEY`        | Clients that let you set a header (Claude Code) |
+| An OAuth access token issued by this server | Clients that only do OAuth discovery (ChatGPT)  |
+
+The static key is checked first and costs nothing; an OAuth token falls through
+to a store lookup. Adding OAuth did not change the header path.
+
+### Enabling it
+
+Set one secret:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"   # -> MCP_OWNER_PASSWORD
+```
+
+With `MCP_OWNER_PASSWORD` unset, none of the OAuth routes are mounted and the
+server behaves exactly as before. With it set, these appear:
+
+```
+/.well-known/oauth-protected-resource/mcp    RFC 9728 resource metadata
+/.well-known/oauth-authorization-server      RFC 8414 AS metadata
+/authorize   /token   /register   /revoke    OAuth 2.1 + RFC 7591
+/consent                                     the approval screen
+```
+
+`PUBLIC_HOST` and `PUBLIC_SCHEME` must be right: every URL in those metadata
+documents is built from them, and a client follows what it is told.
+
+### The flow
+
+1. ChatGPT fetches `/.well-known/oauth-protected-resource/mcp`, which names
+   this server as its own authorization server, and follows it to the AS
+   metadata. A `401` from `/mcp` also advertises the metadata URL in its
+   `WWW-Authenticate` header, so discovery works from a cold start.
+2. It registers itself via `/register` — dynamic client registration, because
+   it cannot be pre-registered.
+3. It sends your browser to `/authorize`, which issues nothing and redirects to
+   `/consent`.
+4. You enter `MCP_OWNER_PASSWORD`. Only then is an authorization code minted and
+   the browser sent back to the client.
+5. The client exchanges the code at `/token` with PKCE and receives an access
+   token and a refresh token.
+
+### Why a password rather than accounts
+
+There is one user. Inventing a user table to serve one person would be more
+code and more attack surface for no benefit, so the consent screen asks for a
+single owner secret instead. It is compared with `hmac.compare_digest`, so its
+strength is entirely its entropy — generate it, do not choose it.
+
+Registration being open is per RFC 7591 and safe here for one reason: anyone
+can register a client, but registering grants nothing. Every authorization
+still has to be approved on the consent screen.
+
+### Token handling
+
+- Access tokens: opaque random values, 1 hour, in Redis, stored **hashed** —
+  a database dump is not a set of working tokens.
+- Refresh tokens: 30 days, in Mongo so they survive a Redis flush, **rotated
+  on every use** and the old one deleted, the same single-use discipline Oura
+  applies to its own.
+- Authorization codes: 60 seconds, single-use via an atomic `GETDEL`, so a
+  replay finds nothing on any replica.
+- Registered clients: Mongo, so a connector never has to re-register.
+
+Opaque rather than JWTs on purpose: a JWT saves a lookup, but revocation then
+needs a denylist that costs the same lookup, and an opaque token cannot leak
+claims.
+
+Failed consent attempts are counted per authorization request and lock out
+after `OAUTH_CONSENT_MAX_ATTEMPTS`. The counter is keyed on the transaction,
+not the source IP — behind an ingress every request shares one address, so
+per-IP counting would lock out everyone at once or nobody.
+
+### Revoking access
+
+```bash
+curl -sX POST https://oura.dan-leonard.com/revoke -d "token=<access-or-refresh-token>"
+```
+
+Or drop the client's record from `oauth_clients` and delete its refresh tokens
+from `oauth_refresh_tokens`. Rotating `MCP_OWNER_PASSWORD` prevents new
+authorizations but does not revoke existing tokens.
+
 ## Limitations
 
+- **OAuth authorizations are approved with one shared owner secret**, not
+  per-user accounts. Correct for a single-person deployment; it is not a
+  multi-tenant authorization model.
 - **Single account per deployment.** `OURA_ACCOUNT_ID` namespaces every store,
   cache key and lock, so multi-account support means routing an account id
   through the tool layer — not a rewrite, but not done.
@@ -776,8 +996,6 @@ readiness behaviour.
 - **No local historical store.** By design; see
   [Architecture](#what-is-stored-where). If `oura-sync` needs one, that is its
   own schema and its own justification.
-- **`oura-ring` is 0.3.0, not 1.x.** The four missing collections are covered
-  here; if the library adds them, the direct calls can be deleted.
 - **Webhook events are not proactively fetched.** A notification invalidates
   the cache and is recorded; the next tool call fetches fresh data. Prefetching
   would mean storing health data locally, which this service does not do.

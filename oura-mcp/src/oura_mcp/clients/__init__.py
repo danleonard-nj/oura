@@ -1,1 +1,1 @@
-"""Oura API v2 clients. Blocking; always invoked through ThreadOffloader."""
+"""Async Oura API v2 clients, built on the shared httpx2 AsyncClient."""

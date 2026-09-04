@@ -11,7 +11,6 @@ from oura_mcp.models.errors import OuraNotConnectedError, TokenRefreshUnavailabl
 from oura_mcp.services.token_service import TokenService
 from tests.conftest import (
     FakeOAuthClient,
-    FakeOffloader,
     FakeRedis,
     FakeTokenRepository,
     make_token,
@@ -28,7 +27,6 @@ def build_service(config, *, token=None, redis=None, oauth=None, audit_service=N
             repository=repository,  # type: ignore[arg-type]
             oauth_client=oauth or FakeOAuthClient(),  # type: ignore[arg-type]
             redis=redis or FakeRedis(),  # type: ignore[arg-type]
-            offloader=FakeOffloader(),  # type: ignore[arg-type]
             audit=audit_service or AuditService(FakeAuditRepository()),  # type: ignore[arg-type]
             config=config,
         ),
@@ -42,6 +40,30 @@ async def test_valid_token_is_returned_without_refreshing(config):
 
     assert await service.get_access_token("default") == "live"
     assert oauth.refresh_calls == []
+
+
+async def test_rejected_unexpired_token_is_refreshed(config):
+    oauth = FakeOAuthClient()
+    service, repository = build_service(config, token=make_token(access="rejected"), oauth=oauth)
+
+    result = await service.refresh("default", rejected_access_token="rejected")
+
+    assert len(oauth.refresh_calls) == 1
+    assert result.access_token == "access-1"
+    assert repository.token.refresh_token == "refresh-1"
+
+
+async def test_concurrent_rejections_refresh_only_the_rejected_token(config):
+    oauth = FakeOAuthClient()
+    service, repository = build_service(config, token=make_token(access="rejected"), oauth=oauth)
+
+    results = await asyncio.gather(*(
+        service.refresh("default", rejected_access_token="rejected") for _ in range(10)
+    ))
+
+    assert len(oauth.refresh_calls) == 1
+    assert len(repository.saves) == 1
+    assert {result.access_token for result in results} == {"access-1"}
 
 
 async def test_expired_token_triggers_refresh(config):

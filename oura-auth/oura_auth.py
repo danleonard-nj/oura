@@ -38,7 +38,12 @@ from pymongo import MongoClient
 
 AUTHORIZE_URL = "https://cloud.ouraring.com/oauth/authorize"
 TOKEN_URL = "https://api.ouraring.com/oauth/token"
-DEFAULT_SCOPES = "email personal daily heartrate workout tag session spo2"
+DEFAULT_SCOPES = (
+    "email personal daily heartrate workout tag session spo2 "
+    # Undocumented, but required by daily_resilience, cardiovascular age /
+    # VO2 max, and ring configuration. Oura returns 401 without them.
+    "stress heart_health ring_configuration"
+)
 COLLECTION = "oauth_tokens"
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")

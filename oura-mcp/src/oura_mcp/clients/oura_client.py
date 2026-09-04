@@ -1,129 +1,114 @@
-"""Blocking Oura API client.
+"""Async Oura API v2 client.
 
-Everything in this module runs on a worker thread, never on the event loop.
-`OuraService` is the only caller and it is responsible for the offload; keeping
-the blocking code in its own module makes that boundary obvious.
+Every collection is the same shape -- `GET /v2/usercollection/{segment}` with
+`start_date`/`end_date` and `next_token` pagination -- so the whole surface is
+one map plus one pagination loop. That is why `oura-ring` was dropped: it added
+a synchronous `requests` dependency, a thread pool to keep it off the event
+loop, and coverage gaps for four collections, in exchange for code we can spell
+out in eighty lines.
 
-`oura-ring` covers most of the v2 surface. Four collections that exist in Oura's
-published OpenAPI spec are absent from the library, so they are issued here
-through the same authenticated session rather than reimplementing the client:
-
-    daily_resilience, daily_cardiovascular_age, vO2_max, ring_battery_level
-
-Webhook subscription management is likewise absent and lives in
-`WebhookSubscriptionClient` below.
+Nothing here blocks. The shared `httpx2.AsyncClient` is a singleton, so
+connection pooling and keep-alive work across the whole application rather than
+per worker thread.
 """
 
 from __future__ import annotations
 
-import threading
 from typing import Any
 
-import requests
-from oura_ring import API_URL, OuraClient
+from httpx2 import AsyncClient
 
+from oura_mcp.config import Config
 from oura_mcp.models.resources import Resource
 
-#: Collections `oura-ring` does not expose, mapped to their v2 path segment.
-#: Each is a plain date-ranged, `next_token`-paginated user collection.
-UNSUPPORTED_BY_LIBRARY: dict[Resource, str] = {
+API_URL = "https://api.ouraring.com"
+
+#: Resource -> path segment under /v2/usercollection/.
+#: Mostly identical to the enum value; VO2 max is the odd one out because Oura
+#: spells the path `vO2_max` while its webhook data_type is `vo2_max`.
+RESOURCE_PATHS: dict[Resource, str] = {
+    Resource.DAILY_SLEEP: "daily_sleep",
+    Resource.DAILY_READINESS: "daily_readiness",
+    Resource.DAILY_ACTIVITY: "daily_activity",
+    Resource.DAILY_STRESS: "daily_stress",
+    Resource.DAILY_SPO2: "daily_spo2",
     Resource.DAILY_RESILIENCE: "daily_resilience",
     Resource.DAILY_CARDIOVASCULAR_AGE: "daily_cardiovascular_age",
     Resource.VO2_MAX: "vO2_max",
+    Resource.SLEEP: "sleep",
+    Resource.SLEEP_TIME: "sleep_time",
+    Resource.HEARTRATE: "heartrate",
+    Resource.WORKOUT: "workout",
+    Resource.SESSION: "session",
+    Resource.TAG: "tag",
+    Resource.ENHANCED_TAG: "enhanced_tag",
+    Resource.REST_MODE_PERIOD: "rest_mode_period",
+    Resource.RING_CONFIGURATION: "ring_configuration",
     Resource.RING_BATTERY_LEVEL: "ring_battery_level",
+    Resource.PERSONAL_INFO: "personal_info",
 }
 
-#: Resource -> the `oura-ring` method that serves it.
-LIBRARY_METHODS: dict[Resource, str] = {
-    Resource.DAILY_SLEEP: "get_daily_sleep",
-    Resource.DAILY_READINESS: "get_daily_readiness",
-    Resource.DAILY_ACTIVITY: "get_daily_activity",
-    Resource.DAILY_STRESS: "get_daily_stress",
-    Resource.DAILY_SPO2: "get_daily_spo2",
-    Resource.SLEEP: "get_sleep_periods",
-    Resource.SLEEP_TIME: "get_sleep_time",
-    Resource.WORKOUT: "get_workouts",
-    Resource.SESSION: "get_sessions",
-    Resource.TAG: "get_tags",
-    Resource.ENHANCED_TAG: "get_enhanced_tag",
-    Resource.REST_MODE_PERIOD: "get_rest_mode_period",
-    Resource.RING_CONFIGURATION: "get_ring_configuration",
-}
+#: Guard against a malformed `next_token` loop. Oura pages in hundreds; a range
+#: wide enough to need more than this is already refused by date validation.
+MAX_PAGES = 100
 
 
-class BlockingOuraClient:
-    """Thread-confined access to the Oura API.
+class OuraApiClient:
+    """Reads Oura user collections.
 
-    `requests.Session` is not safe to share across threads while mutating its
-    headers, and the access token changes on refresh. Each worker thread
-    therefore gets its own `OuraClient`, and the bearer token is applied per
-    call. Connections are still pooled within a thread.
+    Raises `httpx2.HTTPStatusError` on a non-2xx response and the usual
+    `httpx2` transport errors otherwise. `OuraService` owns the translation of
+    those into domain errors, so this stays a transport concern.
     """
 
-    def __init__(self, *, timeout_seconds: int = 30) -> None:
-        self._timeout = timeout_seconds
-        self._local = threading.local()
+    def __init__(self, http: AsyncClient, config: Config) -> None:
+        self._http = http
+        self._timeout = config.oura_request_timeout_seconds
 
-    def _client(self, access_token: str) -> OuraClient:
-        client: OuraClient | None = getattr(self._local, "client", None)
-        if client is None:
-            client = OuraClient(access_token)
-            self._local.client = client
-        else:
-            client.session.headers["Authorization"] = f"Bearer {access_token}"
-        return client
-
-    # ── Collections served by oura-ring ───────────────────────────────────
-
-    def fetch_range(
+    async def fetch_range(
         self,
         access_token: str,
         resource: Resource,
         start_date: str,
         end_date: str,
     ) -> list[dict[str, Any]]:
-        """Fetch every document for `resource` between two ISO dates.
-
-        Pagination is followed to completion, so one call covers the whole
-        range rather than one request per day.
-        """
-        client = self._client(access_token)
-
+        """Every document for a resource between two ISO dates, all pages."""
         if resource is Resource.HEARTRATE:
-            # Heart rate is a datetime-bounded time series. Oura treats the
-            # bounds as inclusive instants, so widen to whole days.
-            return client.get_heart_rate(
-                start_datetime=f"{start_date}T00:00:00+00:00",
-                end_datetime=f"{end_date}T23:59:59+00:00",
-            )
+            # A datetime-bounded time series rather than a daily collection.
+            # Oura treats the bounds as instants, so widen to whole days.
+            params = {
+                "start_datetime": f"{start_date}T00:00:00+00:00",
+                "end_datetime": f"{end_date}T23:59:59+00:00",
+            }
+        else:
+            params = {"start_date": start_date, "end_date": end_date}
 
-        if resource in UNSUPPORTED_BY_LIBRARY:
-            return self._paginate(
-                client,
-                UNSUPPORTED_BY_LIBRARY[resource],
-                {"start_date": start_date, "end_date": end_date},
-            )
+        return await self._paginate(access_token, RESOURCE_PATHS[resource], params)
 
-        method_name = LIBRARY_METHODS.get(resource)
-        if method_name is None:
-            raise ValueError(f"{resource} is not a date-ranged collection")
-        return getattr(client, method_name)(start_date=start_date, end_date=end_date)
+    async def fetch_personal_info(self, access_token: str) -> dict[str, Any]:
+        """The profile singleton, which takes no range and does not paginate."""
+        response = await self._http.get(
+            f"{API_URL}/v2/usercollection/personal_info",
+            headers=self._headers(access_token),
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        return response.json()
 
-    def fetch_personal_info(self, access_token: str) -> dict[str, Any]:
-        return self._client(access_token).get_personal_info()
-
-    # ── Collections issued directly ───────────────────────────────────────
-
-    def _paginate(
-        self, client: OuraClient, segment: str, params: dict[str, str]
+    async def _paginate(
+        self, access_token: str, segment: str, params: dict[str, str]
     ) -> list[dict[str, Any]]:
-        """Walk `next_token` for a collection oura-ring does not implement."""
         url = f"{API_URL}/v2/usercollection/{segment}"
         query = dict(params)
         records: list[dict[str, Any]] = []
 
-        while True:
-            response = client.session.get(url, params=query, timeout=self._timeout)
+        for _ in range(MAX_PAGES):
+            response = await self._http.get(
+                url,
+                params=query,
+                headers=self._headers(access_token),
+                timeout=self._timeout,
+            )
             response.raise_for_status()
             payload = response.json()
             records.extend(payload.get("data", []))
@@ -133,36 +118,38 @@ class BlockingOuraClient:
                 return records
             query["next_token"] = next_token
 
-    def close(self) -> None:
-        client: OuraClient | None = getattr(self._local, "client", None)
-        if client is not None:
-            client.close()
-            self._local.client = None
+        return records
+
+    @staticmethod
+    def _headers(access_token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {access_token}"}
 
 
 class WebhookSubscriptionClient:
     """Manage Oura webhook subscriptions.
 
-    Blocking; runs on a worker thread like the rest of this module. These routes
-    authenticate with the application's client id and secret rather than a user
-    access token, and are absent from `oura-ring`.
+    These routes authenticate with the application's client id and secret
+    rather than a user access token, and subscriptions expire -- hence `renew`.
     """
 
-    def __init__(self, client_id: str, client_secret: str, *, timeout_seconds: int = 30) -> None:
+    def __init__(self, http: AsyncClient, config: Config) -> None:
+        self._http = http
         self._headers = {
-            "x-client-id": client_id,
-            "x-client-secret": client_secret,
+            "x-client-id": config.oura_client_id,
+            "x-client-secret": config.oura_client_secret.get_secret_value(),
             "Content-Type": "application/json",
         }
-        self._timeout = timeout_seconds
+        self._timeout = config.oura_request_timeout_seconds
         self._base = f"{API_URL}/v2/webhook/subscription"
 
-    def list_subscriptions(self) -> list[dict[str, Any]]:
-        response = requests.get(self._base, headers=self._headers, timeout=self._timeout)
+    async def list_subscriptions(self) -> list[dict[str, Any]]:
+        response = await self._http.get(
+            self._base, headers=self._headers, timeout=self._timeout
+        )
         response.raise_for_status()
         return response.json()
 
-    def create_subscription(
+    async def create_subscription(
         self,
         *,
         callback_url: str,
@@ -170,7 +157,7 @@ class WebhookSubscriptionClient:
         event_type: str,
         data_type: str,
     ) -> dict[str, Any]:
-        response = requests.post(
+        response = await self._http.post(
             self._base,
             headers=self._headers,
             json={
@@ -184,17 +171,19 @@ class WebhookSubscriptionClient:
         response.raise_for_status()
         return response.json()
 
-    def delete_subscription(self, subscription_id: str) -> None:
-        response = requests.delete(
-            f"{self._base}/{subscription_id}", headers=self._headers, timeout=self._timeout
-        )
-        response.raise_for_status()
-
-    def renew_subscription(self, subscription_id: str) -> dict[str, Any]:
-        response = requests.put(
+    async def renew_subscription(self, subscription_id: str) -> dict[str, Any]:
+        response = await self._http.put(
             f"{self._base}/renew/{subscription_id}",
             headers=self._headers,
             timeout=self._timeout,
         )
         response.raise_for_status()
         return response.json()
+
+    async def delete_subscription(self, subscription_id: str) -> None:
+        response = await self._http.delete(
+            f"{self._base}/{subscription_id}",
+            headers=self._headers,
+            timeout=self._timeout,
+        )
+        response.raise_for_status()

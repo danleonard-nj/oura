@@ -9,7 +9,6 @@ from redis.exceptions import RedisError
 
 from oura_mcp.clients.oauth_client import OuraOAuthClient
 from oura_mcp.config import Config
-from oura_mcp.infrastructure.executor import ThreadOffloader
 from oura_mcp.infrastructure.logging import get_correlation_id, get_logger
 from oura_mcp.models.audit import AuditAction, AuditEvent
 from oura_mcp.models.tokens import ConnectionStatus
@@ -37,14 +36,12 @@ class OAuthService:
         oauth_client: OuraOAuthClient,
         token_service: TokenService,
         redis: Redis,
-        offloader: ThreadOffloader,
         audit: AuditService,
         config: Config,
     ) -> None:
         self._oauth = oauth_client
         self._tokens = token_service
         self._redis = redis
-        self._offloader = offloader
         self._audit = audit
         self._account_id = config.oura_account_id
         self._state_ttl = config.oauth_state_ttl_seconds
@@ -73,7 +70,7 @@ class OAuthService:
         """Validate the callback, exchange the code and persist the grant."""
         account_id = await self._consume_state(state)
 
-        grant = await self._offloader.run(self._oauth.exchange_code, code)
+        grant = await self._oauth.exchange_code(code)
         token = await self._tokens.store_grant(account_id, grant)
 
         await self._audit.record(

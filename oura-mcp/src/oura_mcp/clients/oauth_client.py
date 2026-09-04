@@ -1,14 +1,11 @@
-"""Oura OAuth2 endpoints.
-
-Blocking, like the data client: `OuraService` and `TokenService` offload these
-calls to a worker thread.
-"""
+"""Oura OAuth2 endpoints, async."""
 
 from __future__ import annotations
 
 from urllib.parse import urlencode
 
-import requests
+import httpx2
+from httpx2 import AsyncClient
 
 from oura_mcp.config import Config
 from oura_mcp.infrastructure.logging import get_logger
@@ -24,7 +21,8 @@ TOKEN_URL = "https://api.ouraring.com/oauth/token"
 class OuraOAuthClient:
     """Authorization Code flow against Oura's OAuth2 endpoints."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, http: AsyncClient, config: Config) -> None:
+        self._http = http
         self._client_id = config.oura_client_id
         self._client_secret = config.oura_client_secret.get_secret_value()
         self._redirect_uri = config.oura_redirect_uri
@@ -44,9 +42,9 @@ class OuraOAuthClient:
         )
         return f"{AUTHORIZE_URL}?{query}"
 
-    def exchange_code(self, code: str) -> TokenGrant:
+    async def exchange_code(self, code: str) -> TokenGrant:
         """Trade an authorization code for a token pair."""
-        return self._token_request(
+        return await self._token_request(
             {
                 "grant_type": "authorization_code",
                 "code": code,
@@ -55,33 +53,34 @@ class OuraOAuthClient:
             operation="authorization_code",
         )
 
-    def refresh(self, refresh_token: str) -> TokenGrant:
+    async def refresh(self, refresh_token: str) -> TokenGrant:
         """Trade a refresh token for a new pair.
 
         Oura refresh tokens are single-use: the returned pair replaces both
         halves, and the token passed in is dead once this returns.
         """
-        return self._token_request(
+        return await self._token_request(
             {"grant_type": "refresh_token", "refresh_token": refresh_token},
             operation="refresh_token",
         )
 
-    def _token_request(self, payload: dict[str, str], *, operation: str) -> TokenGrant:
+    async def _token_request(self, payload: dict[str, str], *, operation: str) -> TokenGrant:
         body = payload | {
             "client_id": self._client_id,
             "client_secret": self._client_secret,
         }
         try:
-            response = requests.post(TOKEN_URL, data=body, timeout=self._timeout)
-        except requests.RequestException as exc:
+            response = await self._http.post(TOKEN_URL, data=body, timeout=self._timeout)
+        except httpx2.HTTPError as exc:
             raise TokenRefreshError(
-                f"Could not reach the Oura token endpoint during {operation}: {type(exc).__name__}"
+                f"Could not reach the Oura token endpoint during {operation}: "
+                f"{type(exc).__name__}"
             ) from exc
 
         if response.status_code >= 400:
-            # Oura returns {"error": "...", "error_description": "..."} here.
-            # Only the error code is safe and useful; the body can echo the
-            # grant that was submitted.
+            # Oura returns {"error": ..., "error_description": ...} here. Only
+            # the error code is safe to surface; the body can echo the grant
+            # that was submitted.
             error_code = "unknown_error"
             try:
                 error_code = str(response.json().get("error", error_code))

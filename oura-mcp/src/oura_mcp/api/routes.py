@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pymongo import AsyncMongoClient
 from redis.asyncio import Redis
-from requests import HTTPError, RequestException
+import httpx2
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -13,7 +13,6 @@ from oura_mcp.api.dependencies import admin_guard, resolve
 from oura_mcp.clients.oura_client import WebhookSubscriptionClient
 from oura_mcp.config import Config
 from oura_mcp.infrastructure import mongo, redis as redis_infra
-from oura_mcp.infrastructure.executor import ThreadOffloader
 from oura_mcp.infrastructure.logging import get_logger
 from oura_mcp.repositories.audit_repository import AuditRepository
 from oura_mcp.repositories.webhook_repository import WebhookRepository
@@ -217,11 +216,10 @@ async def _subscription_call(request: Request, operation, *, key: str) -> JSONRe
     client secret, so nothing derived from them may reach the response.
     """
     client = resolve(request, WebhookSubscriptionClient)
-    offloader = resolve(request, ThreadOffloader)
     try:
-        result = await offloader.run(operation, client)
-    except HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else None
+        result = await operation(client)
+    except httpx2.HTTPStatusError as exc:
+        status = exc.response.status_code
         logger.warning("oura subscription call failed", extra={"upstream_status": status})
         return JSONResponse(
             {
@@ -230,7 +228,7 @@ async def _subscription_call(request: Request, operation, *, key: str) -> JSONRe
             },
             status_code=502,
         )
-    except RequestException as exc:
+    except httpx2.HTTPError as exc:
         logger.warning("could not reach oura", extra={"error": type(exc).__name__})
         return JSONResponse(
             {"error": "upstream_error", "detail": "Could not reach the Oura API."},

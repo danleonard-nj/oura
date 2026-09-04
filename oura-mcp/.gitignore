@@ -3,6 +3,9 @@ __pycache__/
 .venv/
 venv/
 .env
+# Production secrets, pushed to the cluster with push-secret.bat.
+# The committed template is .env.prod.example.
+.env.prod
 *.egg-info/
 build/
 dist/

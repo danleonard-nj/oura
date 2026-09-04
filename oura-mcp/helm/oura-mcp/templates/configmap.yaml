@@ -11,11 +11,15 @@ data:
   OURA_ACCOUNT_ID: {{ .Values.config.ouraAccountId | quote }}
   OURA_SCOPES: {{ .Values.config.ouraScopes | quote }}
   MCP_PATH: {{ .Values.config.mcpPath | quote }}
+  {{- with .Values.config.mcpExtraAllowedHosts }}
+  MCP_EXTRA_ALLOWED_HOSTS: {{ . | quote }}
+  {{- end }}
   MCP_STATELESS: {{ .Values.config.mcpStateless | quote }}
   CACHE_ENABLED: {{ .Values.config.cacheEnabled | quote }}
   {{- with (include "oura-mcp.publicHost" .) }}
   PUBLIC_HOST: {{ . | quote }}
   {{- end }}
+  PUBLIC_SCHEME: {{ ternary "https" "http" .Values.ingress.tls.enabled | quote }}
   {{- with (include "oura-mcp.redirectUri" .) }}
   OURA_REDIRECT_URI: {{ . | quote }}
   {{- end }}

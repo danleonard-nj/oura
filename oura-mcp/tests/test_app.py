@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 import pytest
 from starlette.testclient import TestClient
 
-from oura_mcp.clients.oura_client import BlockingOuraClient, WebhookSubscriptionClient
+from oura_mcp.clients.oura_client import OuraApiClient, WebhookSubscriptionClient
 from oura_mcp.config import Config
 from oura_mcp.models.resources import Resource
 from oura_mcp.repositories.audit_repository import AuditRepository
@@ -47,7 +47,7 @@ class StubOuraClient:
         self.calls: list[tuple] = []
         self.error: Exception | None = None
 
-    def fetch_range(self, token, resource, start, end):
+    async def fetch_range(self, token, resource, start, end):
         self.calls.append((resource, start, end))
         if self.error:
             raise self.error
@@ -55,14 +55,11 @@ class StubOuraClient:
             return [{"day": "2026-09-01", "activity": "cycling"}]
         return SLEEP_RECORDS
 
-    def fetch_personal_info(self, token):
+    async def fetch_personal_info(self, token):
         self.calls.append(("personal_info",))
         if self.error:
             raise self.error
         return {"age": 41, "biological_sex": "male", "weight": 78.0}
-
-    def fetch_document(self, token, resource, document_id):  # pragma: no cover
-        return {"id": document_id}
 
 
 class StubSubscriptions:
@@ -73,7 +70,7 @@ class StubSubscriptions:
         self.renewed: list[str] = []
         self.deleted: list[str] = []
 
-    def list_subscriptions(self):
+    async def list_subscriptions(self):
         return [
             {
                 "id": "sub-1",
@@ -82,15 +79,15 @@ class StubSubscriptions:
             }
         ]
 
-    def create_subscription(self, **kwargs):
+    async def create_subscription(self, **kwargs):
         self.created.append(kwargs)
         return {"id": "sub-2", **kwargs}
 
-    def renew_subscription(self, subscription_id):
+    async def renew_subscription(self, subscription_id):
         self.renewed.append(subscription_id)
         return {"id": subscription_id, "expiration_time": "2027-01-01T00:00:00+00:00"}
 
-    def delete_subscription(self, subscription_id):
+    async def delete_subscription(self, subscription_id):
         self.deleted.append(subscription_id)
         return None
 
@@ -152,7 +149,7 @@ def client(config: Config, fakes, monkeypatch):
         services.add_singleton(TokenRepository, factory=lambda _: fakes["tokens"])
         services.add_singleton(AuditRepository, factory=lambda _: fakes["audit"])
         services.add_singleton(WebhookRepository, factory=lambda _: fakes["webhooks"])
-        services.add_singleton(BlockingOuraClient, factory=lambda _: fakes["oura"])
+        services.add_singleton(OuraApiClient, factory=lambda _: fakes["oura"])
         services.add_singleton(
             WebhookSubscriptionClient, factory=lambda _: fakes["subscriptions"]
         )
@@ -381,6 +378,28 @@ def test_summary_joins_resources_by_day(client):
     assert set(days) == {"2026-09-01", "2026-09-02"}
     assert days["2026-09-01"]["sleep"]["score"] == 82
     assert days["2026-09-01"]["workouts"][0]["activity"] == "cycling"
+
+
+def test_summary_with_unavailable_resilience_is_audited_as_partial(client, fakes, monkeypatch):
+    from oura_mcp.models.errors import OuraPermissionError
+
+    original = fakes["oura"].fetch_range
+
+    def fetch(token, resource, start, end):
+        if resource is Resource.DAILY_RESILIENCE:
+            raise OuraPermissionError("Resilience unavailable")
+        return original(token, resource, start, end)
+
+    monkeypatch.setattr(fakes["oura"], "fetch_range", fetch)
+    result = call_tool(client, "oura_summary", {
+        "start_date": "2026-09-01", "end_date": "2026-09-02",
+    })
+
+    summary = result["result"]["structuredContent"]
+    assert summary["days"]
+    assert len(summary["unavailable"]) == 1
+    invocation = next(e for e in fakes["audit"].events if e.action.value == "tool_invoked")
+    assert invocation.status == "partial"
 
 
 def test_an_invalid_date_is_reported_as_a_tool_error(client):

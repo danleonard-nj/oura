@@ -84,7 +84,7 @@ def register_tools(server: MCPServer, context: ToolContext) -> None:
                     start_date=date_range.start.isoformat() if date_range else None,
                     end_date=date_range.end.isoformat() if date_range else None,
                     duration_ms=_elapsed(started),
-                    upstream_status=exc.status_code,
+                    upstream_status=exc.upstream_status,
                     error_category=exc.category,
                     error_message=exc.message,
                 )
@@ -98,6 +98,7 @@ def register_tools(server: MCPServer, context: ToolContext) -> None:
                 action=AuditAction.TOOL_INVOKED,
                 account_id=oura.account_id,
                 correlation_id=get_correlation_id(),
+                status="partial" if isinstance(result, Summary) and result.unavailable else "ok",
                 tool=tool,
                 resource=resource.value if resource else None,
                 start_date=date_range.start.isoformat() if date_range else None,

@@ -12,16 +12,15 @@ authors = [{ name = "Dan Leonard", email = "dcl525@gmail.com" }]
 
 dependencies = [
     "mcp>=2.1.1,<3",
-    "oura-ring>=0.3.0,<1",
     "hypercorn>=0.17",
     "starlette>=0.41",
+    "httpx2>=2.5",
     "pymongo>=4.9",
     "redis>=5.0",
     "cryptography>=43",
     "pydantic>=2.9",
     "pydantic-settings>=2.5",
     "pydepi>=0.1.0",
-    "requests>=2.32",
     "python-dotenv>=1.0",
 ]
 

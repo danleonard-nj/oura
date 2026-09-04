@@ -7,7 +7,16 @@ from functools import cached_property
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DEFAULT_SCOPES = "email personal daily heartrate workout tag session spo2"
+# Oura's OpenAPI spec lists only: email personal daily heartrate workout tag
+# session spo2Daily. Three more exist and are required by real endpoints, and
+# Oura returns 401 -- not 403 -- when they are missing:
+#   stress             -> daily_resilience
+#   heart_health       -> daily_cardiovascular_age, vO2_max
+#   ring_configuration -> ring_configuration, ring_battery_level
+DEFAULT_SCOPES = (
+    "email personal daily heartrate workout tag session spo2 "
+    "stress heart_health ring_configuration"
+)
 
 
 class Config(BaseSettings):
@@ -41,6 +50,22 @@ class Config(BaseSettings):
     mcp_stateless: bool = True
     mcp_server_name: str = "oura"
 
+    # ── MCP OAuth (for clients that cannot send a static header) ──────────
+    # Leave unset to run with bearer-token auth only. Setting it turns this
+    # service into an OAuth 2.1 authorization server as well, which is what
+    # ChatGPT and other discovery-only clients require.
+    #
+    # This is the secret you type on the consent screen to approve an
+    # authorization. Generate it like an API key, not like a memorable
+    # password -- it is compared directly, so its entropy is its strength.
+    mcp_owner_password: SecretStr | None = None
+    oauth_access_token_ttl_seconds: int = Field(default=3600, ge=300, le=86400)
+    oauth_refresh_token_ttl_seconds: int = Field(default=2592000, ge=3600)
+    oauth_authorization_code_ttl_seconds: int = Field(default=60, ge=30, le=600)
+    oauth_consent_ttl_seconds: int = Field(default=600, ge=60, le=3600)
+    oauth_consent_max_attempts: int = Field(default=5, ge=1, le=50)
+    oauth_consent_lockout_seconds: int = Field(default=900, ge=60)
+
     # ── Secrets ───────────────────────────────────────────────────────────
     token_encryption_key: SecretStr
 
@@ -53,7 +78,18 @@ class Config(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     public_host: str = ""
+    # Scheme the service is reached on from outside. Only ever http for
+    # local development; OAuth metadata URLs are built from it, and an
+    # http issuer would have clients sending tokens in the clear.
+    public_scheme: str = "https"
     log_level: str = "INFO"
+
+    # Extra Host header values the MCP transport will accept, comma-separated.
+    # Needed when something in front of the service rewrites Host -- a reverse
+    # proxy forwarding to the cluster-internal name, for example. Leave empty
+    # unless a proxy actually needs it; every entry widens the DNS-rebinding
+    # allowlist.
+    mcp_extra_allowed_hosts: str = ""
 
     # ── Webhooks ──────────────────────────────────────────────────────────
     oura_webhook_verification_token: SecretStr | None = None
@@ -92,6 +128,14 @@ class Config(BaseSettings):
             raise ValueError("mcp_path must not be the application root")
         return path
 
+    @field_validator("public_scheme")
+    @classmethod
+    def _validate_scheme(cls, value: str) -> str:
+        scheme = value.strip().lower()
+        if scheme not in {"http", "https"}:
+            raise ValueError(f"public_scheme must be http or https, got {value!r}")
+        return scheme
+
     @field_validator("public_host")
     @classmethod
     def _strip_scheme(cls, value: str) -> str:
@@ -111,6 +155,22 @@ class Config(BaseSettings):
             ) from exc
         return self
 
+    @property
+    def mcp_oauth_enabled(self) -> bool:
+        """OAuth is served only when an owner password is configured.
+
+        Without one there is no way to approve an authorization, so the
+        endpoints would exist but never issue a token.
+        """
+        return self.mcp_owner_password is not None
+
+    @property
+    def public_base_url(self) -> str:
+        """The externally reachable origin, used for OAuth metadata URLs."""
+        if self.public_host:
+            return f"{self.public_scheme}://{self.public_host}"
+        return f"http://localhost:{self.port}"
+
     @cached_property
     def scope_list(self) -> list[str]:
         return self.oura_scopes.split()
@@ -125,14 +185,21 @@ class Config(BaseSettings):
         hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*", "127.0.0.1", "localhost"]
         if self.public_host:
             hosts.extend([self.public_host, f"{self.public_host}:*"])
+        for extra in self._split(self.mcp_extra_allowed_hosts):
+            hosts.extend([extra, f"{extra}:*"])
         return hosts
 
     @cached_property
     def allowed_origins(self) -> list[str]:
         origins = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
-        if self.public_host:
-            origins.extend([f"https://{self.public_host}", f"http://{self.public_host}"])
+        for host in [self.public_host, *self._split(self.mcp_extra_allowed_hosts)]:
+            if host:
+                origins.extend([f"https://{host}", f"http://{host}"])
         return origins
+
+    @staticmethod
+    def _split(value: str) -> list[str]:
+        return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def load_config() -> Config:
