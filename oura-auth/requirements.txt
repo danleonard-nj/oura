@@ -1,0 +1,4 @@
+pymongo>=4.9
+cryptography>=43
+requests>=2.32
+python-dotenv>=1.0

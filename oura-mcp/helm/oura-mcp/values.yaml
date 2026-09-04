@@ -1,0 +1,162 @@
+# Default values for oura-mcp.
+
+replicaCount: 1
+
+image:
+  repository: azureks.azurecr.io/oura/oura-mcp
+  pullPolicy: Always
+  tag: "latest"
+
+imagePullSecrets:
+  - name: regcred
+
+nameOverride: "oura-mcp"
+fullnameOverride: "oura-mcp"
+
+serviceAccount:
+  create: true
+  name: "oura-mcp"
+  annotations: {}
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+# ── Application configuration ─────────────────────────────────────────────
+# Non-secret values only. Everything sensitive comes from `secrets` below.
+config:
+  # The ingress hostname, no scheme. REQUIRED in production: the MCP
+  # transport's DNS-rebinding protection rejects any Host header not on its
+  # allowlist, and this is what populates it. Defaults to ingress.hostname.
+  publicHost: ""
+  logLevel: INFO
+  mongodbDatabase: oura_mcp
+  ouraAccountId: default
+  ouraScopes: "email personal daily heartrate workout tag session spo2"
+  # Full callback URL registered on the Oura OAuth application.
+  ouraRedirectUri: ""
+  mcpPath: /mcp
+  # Stateless keeps no session state in a replica's memory, so no sticky
+  # sessions are needed and any replica can serve any request.
+  mcpStateless: true
+  cacheEnabled: true
+  # Extra plain environment variables, as name/value pairs.
+  extraEnv: []
+
+# ── Secrets ───────────────────────────────────────────────────────────────
+# Preferred: reference a Secret you already manage.
+#
+#   existingSecret: oura-mcp
+#
+# The Secret must contain these keys:
+#   OURA_CLIENT_ID, OURA_CLIENT_SECRET, MCP_API_KEY, TOKEN_ENCRYPTION_KEY,
+#   MONGODB_URI, REDIS_URL, and optionally OURA_WEBHOOK_VERIFICATION_TOKEN.
+#
+# Alternatively set the values under `secrets` and the chart renders a Secret.
+# Anything left empty is omitted, so it can come from `existingSecret` instead.
+# Values supplied this way land in your Helm release history in plain text --
+# prefer existingSecret for anything long-lived.
+existingSecret: ""
+
+secrets:
+  ouraClientId: ""
+  ouraClientSecret: ""
+  mcpApiKey: ""
+  tokenEncryptionKey: ""
+  # Mongo and Redis already exist in the cluster; this chart does not deploy
+  # them. Supply their connection strings here or via existingSecret.
+  mongodbUri: ""
+  redisUrl: ""
+  ouraWebhookVerificationToken: ""
+
+# ── Probes ────────────────────────────────────────────────────────────────
+# /health is dependency-free so a Mongo or Redis blip cannot cause a restart
+# loop. /ready checks Mongo and Redis and removes the pod from the Service.
+probes:
+  liveness:
+    path: /health
+    initialDelaySeconds: 5
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    path: /ready
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 192Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+# Matches the uid/gid baked into the image.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# Long enough for Hypercorn's --graceful-timeout of 25s to finish draining.
+terminationGracePeriodSeconds: 30
+
+# ── Ingress ───────────────────────────────────────────────────────────────
+ingress:
+  enabled: false
+  className: ""
+  hostname: oura-mcp.example.com
+  path: /
+  pathType: Prefix
+  # Streamable HTTP holds a response open while a tool runs, so proxy read and
+  # send timeouts must be generous and response buffering must be off, or the
+  # proxy will cut the stream mid-call. The defaults below are ingress-nginx
+  # annotations; see the README for Traefik and HAProxy equivalents. Replace
+  # them wholesale if you run a different controller.
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "4m"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+  tls:
+    enabled: false
+    secretName: ""
+    # Set to issue a certificate automatically, e.g. letsencrypt-prod.
+    clusterIssuer: ""
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+# Keeps a replica available during voluntary disruption once replicaCount > 1.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

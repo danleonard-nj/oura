@@ -1,0 +1,76 @@
+oura-mcp {{ .Chart.AppVersion }} is deployed as {{ include "oura-mcp.fullname" . }}.
+
+{{- $host := include "oura-mcp.publicHost" . }}
+{{- $scheme := ternary "https" "http" .Values.ingress.tls.enabled }}
+
+1. Check it came up:
+
+     kubectl rollout status deployment/{{ include "oura-mcp.fullname" . }} -n {{ .Release.Namespace }}
+     kubectl port-forward svc/{{ include "oura-mcp.fullname" . }} 8000:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+     curl -s localhost:8000/ready | jq
+
+   /ready reports Mongo and Redis. Both must be reachable before the pod
+   joins the Service.
+
+{{- if not .Values.ingress.enabled }}
+
+2. Ingress is disabled, so nothing is reachable from outside the cluster.
+   Enable it with --set ingress.enabled=true --set ingress.hostname=<host>.
+
+   PUBLIC_HOST is currently {{ if $host }}{{ $host }}{{ else }}UNSET{{ end }}.
+   Without it the MCP transport's DNS-rebinding protection rejects every
+   request that does not arrive on localhost.
+{{- else }}
+
+2. Connect the Oura account, once:
+
+     open {{ $scheme }}://{{ .Values.ingress.hostname }}/oauth/authorize
+
+   Or run the oura-auth bootstrap tool, which writes the same encrypted token
+   document straight into Mongo.
+
+   Confirm afterwards:
+
+     curl -s -H "Authorization: Bearer $MCP_API_KEY" \
+       {{ $scheme }}://{{ .Values.ingress.hostname }}/api/status | jq
+
+3. Point an MCP client at it:
+
+     claude mcp add --transport http oura {{ $scheme }}://{{ .Values.ingress.hostname }}{{ .Values.config.mcpPath }} \
+       --header "Authorization: Bearer $MCP_API_KEY"
+
+   Any Streamable HTTP MCP client works with the same URL and header.
+
+4. Register webhooks so cached data is invalidated as the ring syncs:
+
+     curl -X POST https://api.ouraring.com/v2/webhook/subscription \
+       -H "x-client-id: $OURA_CLIENT_ID" \
+       -H "x-client-secret: $OURA_CLIENT_SECRET" \
+       -H "Content-Type: application/json" \
+       -d '{"callback_url":"{{ $scheme }}://{{ .Values.ingress.hostname }}/webhooks/oura",
+            "verification_token":"'"$OURA_WEBHOOK_VERIFICATION_TOKEN"'",
+            "event_type":"update","data_type":"daily_sleep"}'
+
+   One subscription per event_type/data_type pair. The endpoint must already
+   be reachable: Oura verifies it before activating the subscription.
+{{- end }}
+
+{{- if eq (include "oura-mcp.createSecret" .) "true" }}
+
+NOTE: this release rendered its own Secret from inline values, so those
+credentials are stored in the Helm release history in plain text. For anything
+long-lived, create the Secret separately and set `existingSecret` instead.
+{{- else if not .Values.existingSecret }}
+
+WARNING: no `existingSecret` and no inline secret values. The pod has no
+credentials and will fail to start with a configuration error. Set
+`existingSecret` to a Secret containing OURA_CLIENT_ID, OURA_CLIENT_SECRET,
+MCP_API_KEY, TOKEN_ENCRYPTION_KEY, MONGODB_URI and REDIS_URL.
+{{- end }}
+
+{{- if gt (int .Values.replicaCount) 1 }}
+
+Running {{ .Values.replicaCount }} replicas. Sticky sessions are not required:
+the MCP transport is stateless, and OAuth refresh is serialised across replicas
+by a Redis lock.
+{{- end }}
