@@ -15,6 +15,7 @@ from oura_mcp.config import Config
 from oura_mcp.infrastructure import mongo, redis as redis_infra
 from oura_mcp.infrastructure.logging import get_logger
 from oura_mcp.repositories.audit_repository import AuditRepository
+from oura_mcp.repositories.request_log_repository import RequestLogRepository
 from oura_mcp.repositories.webhook_repository import WebhookRepository
 from oura_mcp.services.token_service import TokenService
 
@@ -97,6 +98,23 @@ async def audit(request: Request) -> JSONResponse:
     limit = _int_param(request, "limit", default=50, maximum=500)
     events = await repository.recent(config.oura_account_id, limit=limit)
     return JSONResponse({"count": len(events), "events": events}, status_code=200)
+
+
+async def request_log(request: Request) -> JSONResponse:
+    """Recent HTTP requests, most-recent first.
+
+    Everything that reached the app -- MCP calls, health probes excluded,
+    and the opportunistic scanner traffic every public ingress attracts.
+    Short retention (see `ensure_indexes`); this is for spotting patterns,
+    not a durable audit trail.
+    """
+    if (denied := admin_guard(request)) is not None:
+        return denied
+
+    repository = resolve(request, RequestLogRepository)
+    limit = _int_param(request, "limit", default=50, maximum=500)
+    entries = await repository.recent(limit=limit)
+    return JSONResponse({"count": len(entries), "requests": entries}, status_code=200)
 
 
 async def webhook_events(request: Request) -> JSONResponse:
@@ -256,6 +274,7 @@ ROUTES = [
     Route("/ready", ready, methods=["GET"]),
     Route("/api/status", status, methods=["GET"]),
     Route("/api/audit", audit, methods=["GET"]),
+    Route("/api/requests", request_log, methods=["GET"]),
     Route("/api/webhooks/events", webhook_events, methods=["GET"]),
     Route("/api/webhooks/subscriptions", list_subscriptions, methods=["GET"]),
     Route("/api/webhooks/subscriptions", create_subscription, methods=["POST"]),

@@ -195,3 +195,26 @@ def test_the_committed_template_parses_and_documents_every_required_key(tmp_path
     assert problems == [], problems
     for key in validate_env_file.REQUIRED + validate_env_file.OPTIONAL:
         assert key in values, f"{key} is missing from .env.example"
+
+
+def test_a_duplicate_key_is_reported(tmp_path):
+    """Last assignment wins silently, so the earlier one is invisible."""
+    content = COMPLETE + "OURA_CLIENT_ID=a-second-value\n"
+
+    problems = problems_for(tmp_path, content)
+
+    assert any("set again" in problem for problem in problems)
+    assert run(tmp_path, content) == 1
+
+
+def test_a_repeated_key_with_the_same_value_is_still_reported(tmp_path):
+    """Even harmless duplication hides which line is in effect."""
+    content = COMPLETE + "REDIS_URL=redis://redis:6379/0\n"
+
+    assert run(tmp_path, content) == 1
+
+
+def test_the_duplicate_message_names_both_lines(tmp_path):
+    problems = problems_for(tmp_path, "A=1\nB=2\nA=3\n")
+
+    assert any("line 3" in p and "line 1" in p for p in problems)

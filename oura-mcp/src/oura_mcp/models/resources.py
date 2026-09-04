@@ -47,7 +47,9 @@ class ResourceSpec:
     max_days: int | None = None
     #: Data that effectively never changes gets the long "static" TTL.
     static: bool = False
-    #: The OAuth scope Oura requires. Used only to explain 403s.
+    #: The OAuth scope Oura actually requires. Verified by probing every
+    #: endpoint with a live token -- three of these are absent from Oura's
+    #: OpenAPI spec, and Oura answers 401 rather than 403 when one is missing.
     scope: str = "daily"
 
 
@@ -57,9 +59,9 @@ SPECS: dict[Resource, ResourceSpec] = {
     Resource.DAILY_ACTIVITY: ResourceSpec(Resource.DAILY_ACTIVITY),
     Resource.DAILY_STRESS: ResourceSpec(Resource.DAILY_STRESS),
     Resource.DAILY_SPO2: ResourceSpec(Resource.DAILY_SPO2, scope="spo2"),
-    Resource.DAILY_RESILIENCE: ResourceSpec(Resource.DAILY_RESILIENCE),
-    Resource.DAILY_CARDIOVASCULAR_AGE: ResourceSpec(Resource.DAILY_CARDIOVASCULAR_AGE),
-    Resource.VO2_MAX: ResourceSpec(Resource.VO2_MAX),
+    Resource.DAILY_RESILIENCE: ResourceSpec(Resource.DAILY_RESILIENCE, scope="stress"),
+    Resource.DAILY_CARDIOVASCULAR_AGE: ResourceSpec(Resource.DAILY_CARDIOVASCULAR_AGE, scope="heart_health"),
+    Resource.VO2_MAX: ResourceSpec(Resource.VO2_MAX, scope="heart_health"),
     Resource.SLEEP: ResourceSpec(Resource.SLEEP),
     Resource.SLEEP_TIME: ResourceSpec(Resource.SLEEP_TIME),
     Resource.HEARTRATE: ResourceSpec(
@@ -70,8 +72,12 @@ SPECS: dict[Resource, ResourceSpec] = {
     Resource.TAG: ResourceSpec(Resource.TAG, scope="tag"),
     Resource.ENHANCED_TAG: ResourceSpec(Resource.ENHANCED_TAG, scope="tag"),
     Resource.REST_MODE_PERIOD: ResourceSpec(Resource.REST_MODE_PERIOD),
-    Resource.RING_CONFIGURATION: ResourceSpec(Resource.RING_CONFIGURATION, static=True),
-    Resource.RING_BATTERY_LEVEL: ResourceSpec(Resource.RING_BATTERY_LEVEL),
+    Resource.RING_CONFIGURATION: ResourceSpec(
+        Resource.RING_CONFIGURATION, static=True, scope="ring_configuration"
+    ),
+    Resource.RING_BATTERY_LEVEL: ResourceSpec(
+        Resource.RING_BATTERY_LEVEL, scope="ring_configuration"
+    ),
     Resource.PERSONAL_INFO: ResourceSpec(
         Resource.PERSONAL_INFO, date_ranged=False, static=True, scope="personal"
     ),

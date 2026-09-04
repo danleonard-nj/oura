@@ -15,6 +15,13 @@ logger = get_logger(__name__)
 OAUTH_TOKENS = "oauth_tokens"
 AUDIT_EVENTS = "audit_events"
 WEBHOOK_EVENTS = "webhook_events"
+REQUEST_LOG = "request_log"
+
+# request_log is a firehose (every request, bot scans included), not a durable
+# audit trail -- see models.request_log -- so it self-prunes via a TTL index
+# rather than growing forever. A week is enough to spot and review traffic
+# patterns without needing dashboards or alerting stood up.
+REQUEST_LOG_TTL_SECONDS = 7 * 24 * 3600
 
 
 def create_mongo_client(config: Config) -> AsyncMongoClient:
@@ -53,3 +60,5 @@ async def ensure_indexes(database: AsyncDatabase) -> None:
     await database[AUDIT_EVENTS].create_index([("account_id", 1), ("timestamp", -1)])
     await database[WEBHOOK_EVENTS].create_index("dedupe_key", unique=True)
     await database[WEBHOOK_EVENTS].create_index([("received_at", -1)])
+    await database[REQUEST_LOG].create_index([("timestamp", -1)])
+    await database[REQUEST_LOG].create_index("timestamp", expireAfterSeconds=REQUEST_LOG_TTL_SECONDS)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import sys
@@ -83,22 +82,29 @@ def redact(value: Any, _depth: int = 0) -> Any:
 
 
 class StructuredFormatter(logging.Formatter):
-    """Emits one JSON object per line, with any `extra=` fields merged in."""
+    """Emits one readable line, with any ``extra=`` fields appended."""
 
     def format(self, record: logging.LogRecord) -> str:
-        payload: dict[str, Any] = {
-            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
-            "level": record.levelname,
-            "component": record.name,
-            "correlation_id": getattr(record, "correlation_id", None) or get_correlation_id(),
-            "message": redact_text(record.getMessage()),
-        }
+        timestamp = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
+        correlation_id = getattr(record, "correlation_id", None) or get_correlation_id()
+        line = f"{timestamp} {record.levelname:<8} {record.name} [{correlation_id}] {redact_text(record.getMessage())}"
+
+        fields = []
         for key, value in record.__dict__.items():
             if key not in STANDARD_RECORD_FIELDS and key != "correlation_id":
-                payload[key] = redact_field(key, value)
+                fields.append(f"{key}={_format_value(redact_field(key, value))}")
+        if fields:
+            line += " | " + " ".join(fields)
         if record.exc_info:
-            payload["exception"] = redact_text(self.formatException(record.exc_info))
-        return json.dumps(payload, default=str)
+            line += " | exception=" + _format_value(redact_text(self.formatException(record.exc_info)))
+        return line
+
+
+def _format_value(value: Any) -> str:
+    """Keep fields compact while making strings and collections unambiguous."""
+    if isinstance(value, str):
+        return repr(value)
+    return repr(value)
 
 
 class CorrelationIdFilter(logging.Filter):
@@ -120,8 +126,13 @@ def configure_logging(level: str = "INFO") -> None:
     root.addHandler(handler)
     root.setLevel(level)
 
-    # These are chatty and their payloads can contain URLs with query strings.
-    for noisy in ("urllib3", "requests", "hypercorn.access", "pymongo"):
+    # These are chatty and duplicate what we already log ourselves: httpx2
+    # logs one INFO line per outbound call ("HTTP Request: GET ..."), which is
+    # the same request the audit service logs as `oura_request` with the
+    # status, timing and resource already attached. urllib3/requests/pymongo
+    # are transitive dependencies with the same problem, and their payloads
+    # can contain URLs with query strings.
+    for noisy in ("httpx2", "urllib3", "requests", "pymongo"):
         logging.getLogger(noisy).setLevel(max(logging.WARNING, root.level))
 
 

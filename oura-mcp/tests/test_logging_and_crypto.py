@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 
 import pytest
@@ -38,14 +37,14 @@ def rekeyed(config, key: str):
     return Config(**data)
 
 
-def format_record(**extra) -> dict:
+def format_record(**extra) -> str:
     record = logging.LogRecord(
         name="test", level=logging.INFO, pathname=__file__, lineno=1,
         msg=extra.pop("msg", "hello"), args=(), exc_info=None,
     )
     for key, value in extra.items():
         setattr(record, key, value)
-    return json.loads(StructuredFormatter().format(record))
+    return StructuredFormatter().format(record)
 
 
 # ── Redaction ─────────────────────────────────────────────────────────────
@@ -81,33 +80,30 @@ def test_redaction_reaches_nested_structures():
 def test_authorization_header_in_a_message_is_redacted():
     formatted = format_record(msg=f"calling oura with Bearer {SECRET}")
 
-    assert SECRET not in formatted["message"]
-    assert REDACTED in formatted["message"]
+    assert SECRET not in formatted
+    assert REDACTED in formatted
 
 
 def test_assigned_secret_in_a_message_is_redacted():
     formatted = format_record(msg=f"using access_token={SECRET} now")
 
-    assert SECRET not in formatted["message"]
+    assert SECRET not in formatted
 
 
-def test_extra_fields_are_redacted_in_the_emitted_json():
+def test_extra_fields_are_redacted_in_the_emitted_line():
     formatted = format_record(access_token=SECRET, resource="daily_sleep")
 
-    assert formatted["access_token"] == REDACTED
-    assert formatted["resource"] == "daily_sleep"
+    assert f"access_token='{REDACTED}'" in formatted
+    assert "resource='daily_sleep'" in formatted
 
 
 def test_structured_output_carries_the_expected_fields():
     set_correlation_id("corr-1")
     formatted = format_record(tool="oura_sleep", duration_ms=12.5, cache="hit")
 
-    assert formatted["level"] == "INFO"
-    assert formatted["component"] == "test"
-    assert formatted["correlation_id"] == "corr-1"
-    assert formatted["tool"] == "oura_sleep"
-    assert formatted["duration_ms"] == 12.5
-    assert "timestamp" in formatted
+    assert " INFO     test [corr-1] hello" in formatted
+    assert "tool='oura_sleep'" in formatted
+    assert "duration_ms=12.5" in formatted
 
 
 def test_token_models_do_not_expose_secrets_in_their_repr():
@@ -126,7 +122,7 @@ def test_a_logged_token_model_leaks_nothing():
     token = make_token(access="access-plaintext", refresh="refresh-plaintext")
     formatted = format_record(msg=f"stored {token}")
 
-    assert "access-plaintext" not in json.dumps(formatted)
+    assert "access-plaintext" not in formatted
 
 
 def test_correlation_id_round_trips():

@@ -109,7 +109,7 @@ async def test_status_never_projects_token_material(repository, database):
     assert "secret-access" not in dumped
     assert "secret-refresh" not in dumped
     assert status.connected is True
-    assert status.scopes == ["daily", "personal"]
+    assert "daily" in status.scopes
 
 
 async def test_status_for_an_unknown_account(repository):

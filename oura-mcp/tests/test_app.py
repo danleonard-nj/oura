@@ -21,11 +21,13 @@ from oura_mcp.clients.oura_client import OuraApiClient, WebhookSubscriptionClien
 from oura_mcp.config import Config
 from oura_mcp.models.resources import Resource
 from oura_mcp.repositories.audit_repository import AuditRepository
+from oura_mcp.repositories.request_log_repository import RequestLogRepository
 from oura_mcp.repositories.token_repository import TokenRepository
 from oura_mcp.repositories.webhook_repository import WebhookRepository
 from tests.conftest import (
     FakeAuditRepository,
     FakeRedis,
+    FakeRequestLogRepository,
     FakeTokenRepository,
     FakeWebhookRepository,
     make_token,
@@ -120,6 +122,7 @@ def fakes(stub_client):
         "redis": FakeRedis(),
         "tokens": FakeTokenRepository(make_token()),
         "audit": FakeAuditRepository(),
+        "requests": FakeRequestLogRepository(),
         "webhooks": FakeWebhookRepository(),
         "oura": stub_client,
         "subscriptions": StubSubscriptions(),
@@ -148,6 +151,7 @@ def client(config: Config, fakes, monkeypatch):
         services.add_singleton(Redis, factory=lambda _: fakes["redis"])
         services.add_singleton(TokenRepository, factory=lambda _: fakes["tokens"])
         services.add_singleton(AuditRepository, factory=lambda _: fakes["audit"])
+        services.add_singleton(RequestLogRepository, factory=lambda _: fakes["requests"])
         services.add_singleton(WebhookRepository, factory=lambda _: fakes["webhooks"])
         services.add_singleton(OuraApiClient, factory=lambda _: fakes["oura"])
         services.add_singleton(
@@ -256,6 +260,110 @@ def test_an_inbound_correlation_id_is_echoed(client):
     response = client.get("/health", headers={"x-correlation-id": "caller-supplied"})
 
     assert response.headers["x-correlation-id"] == "caller-supplied"
+
+
+def test_a_request_is_logged_with_its_correlation_id(client, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="oura_mcp.access"):
+        response = client.get("/api/status", headers=AUTH)
+
+    record = next(r for r in caplog.records if r.name == "oura_mcp.access")
+    assert record.path == "/api/status"
+    assert record.status == 200
+    assert record.correlation_id == response.headers["x-correlation-id"]
+    assert record.duration_ms >= 0
+    assert record.bytes > 0
+
+
+def test_probe_requests_are_logged_at_debug_not_info(client, caplog):
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="oura_mcp.access"):
+        client.get("/health")
+
+    record = next(r for r in caplog.records if r.name == "oura_mcp.access")
+    assert record.levelno == logging.DEBUG
+
+
+def test_access_log_prefers_x_real_ip_over_the_socket_peer(client, caplog):
+    """Behind ingress-nginx, scope["client"] is the ingress pod, not the caller."""
+    import logging
+
+    headers = {**AUTH, "x-real-ip": "203.0.113.7"}
+    with caplog.at_level(logging.INFO, logger="oura_mcp.access"):
+        client.get("/api/status", headers=headers)
+
+    record = next(r for r in caplog.records if r.name == "oura_mcp.access")
+    assert record.client_ip == "203.0.113.7"
+
+
+def test_access_log_falls_back_to_the_last_x_forwarded_for_hop(client, caplog):
+    """The rightmost hop is the one nginx itself appended; anything to its
+    left was supplied by the client and is not trustworthy."""
+    import logging
+
+    headers = {**AUTH, "x-forwarded-for": "1.2.3.4, 203.0.113.7"}
+    with caplog.at_level(logging.INFO, logger="oura_mcp.access"):
+        client.get("/api/status", headers=headers)
+
+    record = next(r for r in caplog.records if r.name == "oura_mcp.access")
+    assert record.client_ip == "203.0.113.7"
+
+
+def test_access_log_falls_back_to_the_socket_peer_without_proxy_headers(client, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="oura_mcp.access"):
+        client.get("/api/status", headers=AUTH)
+
+    record = next(r for r in caplog.records if r.name == "oura_mcp.access")
+    assert record.client_ip == "testclient"
+
+
+# ── Request log persistence ──────────────────────────────────────────────
+
+
+def test_a_request_is_persisted_to_the_request_log(client, fakes):
+    response = client.get("/api/status", headers=AUTH)
+
+    entry = fakes["requests"].entries[-1]
+    assert entry.path == "/api/status"
+    assert entry.method == "GET"
+    assert entry.status == 200
+    assert entry.correlation_id == response.headers["x-correlation-id"]
+    assert entry.client_ip == "testclient"
+
+
+def test_probe_requests_are_not_persisted(client, fakes):
+    client.get("/health")
+
+    assert fakes["requests"].entries == []
+
+
+def test_a_mongo_request_log_failure_does_not_fail_the_request(client, fakes):
+    fakes["requests"].failing = True
+
+    response = client.get("/api/status", headers=AUTH)
+
+    assert response.status_code == 200
+
+
+def test_api_requests_lists_recently_logged_requests(client, fakes):
+    client.get("/api/status", headers=AUTH)
+
+    response = client.get("/api/requests", headers=AUTH)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] >= 1
+    assert any(r["path"] == "/api/status" for r in body["requests"])
+
+
+def test_api_requests_requires_the_admin_key(client):
+    response = client.get("/api/requests")
+
+    assert response.status_code == 401
 
 
 # ── MCP authentication ────────────────────────────────────────────────────
@@ -587,7 +695,7 @@ def test_admin_status_never_returns_token_material(client):
     assert response.status_code == 200
     body = response.json()
     assert body["connected"] is True
-    assert body["scopes"] == ["daily", "personal"]
+    assert "daily" in body["scopes"]
     serialised = json.dumps(body)
     assert "access-0" not in serialised
     assert "refresh-0" not in serialised

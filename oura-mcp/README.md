@@ -253,6 +253,26 @@ endpoint it can never reach. `OuraService` therefore inspects the body and
 turns a scope-shaped `401` into a permission error naming the scope — no
 refresh, no retry, and a message that says what to do.
 
+### Ungranted scopes are refused locally
+
+Because a missing scope is a `401`, an ungranted collection would otherwise
+cost a round trip on every call and surface as an auth failure. `oura_summary`
+fans out over six collections, so one ungranted scope taxed every summary.
+
+`OuraService` now compares the resource's required scope against what the
+stored token records Oura actually granted, and refuses locally -- no request,
+no retry, and `oura_summary` reports it in `unavailable` alongside the data
+that did come back.
+
+Two deliberate properties:
+
+- **Unknown means no opinion.** A token record with no scopes (an older
+  connection) blocks nothing; the request goes out and Oura decides.
+- **The map is empirical.** Every entry was verified by probing the live API,
+  because the spec is wrong about three of them. If Oura ever relaxes a
+  requirement, the preflight would refuse something now permitted -- reconnect
+  with the wider scope set, or clear the map entry.
+
 If an account was connected before these were added to `OURA_SCOPES`, four
 tools return a permission error until it reconnects. Check what was granted:
 

@@ -18,3 +18,4 @@ htmlcov/
 # Local MCP client config: holds the live MCP_API_KEY.
 # The committed template is mcp.json.example.
 mcp.json
+.env.prod.bak-scopes

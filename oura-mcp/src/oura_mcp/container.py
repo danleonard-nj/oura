@@ -33,6 +33,7 @@ from oura_mcp.infrastructure.mongo import create_database, create_mongo_client
 from oura_mcp.infrastructure.redis import create_redis_client
 from oura_mcp.repositories.audit_repository import AuditRepository
 from oura_mcp.repositories.oauth_repository import OAuthRepository
+from oura_mcp.repositories.request_log_repository import RequestLogRepository
 from oura_mcp.repositories.token_repository import TokenRepository
 from oura_mcp.repositories.webhook_repository import WebhookRepository
 from oura_mcp.services.audit_service import AuditService
@@ -79,6 +80,7 @@ def register_repositories(services: ServiceCollection) -> None:
     services.add_singleton(AuditRepository)
     services.add_singleton(OAuthRepository)
     services.add_singleton(WebhookRepository)
+    services.add_singleton(RequestLogRepository)
 
 
 def register_services(services: ServiceCollection) -> None:

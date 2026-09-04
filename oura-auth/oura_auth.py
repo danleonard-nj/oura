@@ -377,17 +377,35 @@ def cmd_status(settings: Settings, store: TokenStore) -> int:
     return 0
 
 
+def normalize_scopes(scopes: str) -> set[str]:
+    """Strip the prefix Oura adds when echoing scopes back.
+
+    We ask for `daily`; Oura returns `extapi:daily` for the same thing.
+    Comparing the two forms directly reports every granted scope as missing.
+    """
+    return {scope.removeprefix("extapi:") for scope in scopes.split()}
+
+
 def _report(settings: Settings, document: dict[str, Any], scope: str) -> None:
-    granted = set(scope.split())
-    requested = set(settings.scopes.split())
+    granted = normalize_scopes(scope)
+    requested = normalize_scopes(settings.scopes)
+
     logger.info("\nConnected. Token version %s.", document.get("version"))
     logger.info("Granted scopes: %s", " ".join(sorted(granted)) or "(none)")
+
     if missing := requested - granted:
         logger.warning(
-            "\nNot granted: %s\nTools needing those scopes will return a permission error. "
-            "Re-run `connect` and approve them to fix it.",
+            "\nRequested but NOT granted: %s\n"
+            "Tools needing those scopes will return a permission error.\n"
+            "\n"
+            "Oura only issues a scope its OAuth application is registered for, so "
+            "check the application at https://cloud.ouraring.com/oauth/applications "
+            "has these enabled, then re-run `connect`. Note that Oura silently drops "
+            "a scope the application does not have rather than failing the request.",
             " ".join(sorted(missing)),
         )
+    else:
+        logger.info("All requested scopes were granted.")
 
 
 COMMANDS = {"connect": cmd_connect, "refresh": cmd_refresh, "status": cmd_status}

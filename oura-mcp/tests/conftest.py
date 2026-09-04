@@ -154,6 +154,20 @@ class FakeAuditRepository:
         return [e.model_dump(mode="python") for e in self.events][:limit]
 
 
+class FakeRequestLogRepository:
+    def __init__(self, *, failing: bool = False) -> None:
+        self.entries: list[Any] = []
+        self.failing = failing
+
+    async def record(self, entry) -> None:
+        if self.failing:
+            raise RuntimeError("mongo is down")
+        self.entries.append(entry)
+
+    async def recent(self, *, limit: int = 50):
+        return [e.model_dump(mode="json") for e in self.entries][:limit]
+
+
 class FakeWebhookRepository:
     def __init__(self) -> None:
         self.records: list[Any] = []
@@ -212,13 +226,22 @@ def make_token(
     version: int = 1,
     access: str = "access-0",
     refresh: str = "refresh-0",
+    scopes: list[str] | None = None,
 ) -> OuraToken:
+    """A stored token.
+
+    Scopes default to everything the service asks for, because `OuraService`
+    now refuses locally when a resource's scope is absent. Pass a narrower list
+    to exercise that path.
+    """
+    from oura_mcp.config import DEFAULT_SCOPES
+
     return OuraToken(
         account_id=account_id,
         access_token=access,
         refresh_token=refresh,
         expires_at=datetime.now(UTC) + timedelta(seconds=expires_in),
-        scopes=["daily", "personal"],
+        scopes=scopes if scopes is not None else DEFAULT_SCOPES.split(),
         version=version,
     )
 
@@ -248,6 +271,11 @@ def redis() -> FakeRedis:
 @pytest.fixture
 def audit_repository() -> FakeAuditRepository:
     return FakeAuditRepository()
+
+
+@pytest.fixture
+def request_log_repository() -> FakeRequestLogRepository:
+    return FakeRequestLogRepository()
 
 
 @pytest.fixture

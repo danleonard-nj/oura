@@ -52,9 +52,14 @@ class RecordingClient:
 
 
 class StubTokenService:
-    def __init__(self, tokens=None) -> None:
+    def __init__(self, tokens=None, scopes=None) -> None:
         self.tokens = list(tokens or ["token-a", "token-a"])
         self.refresh_calls = 0
+        # Empty means "unknown", which the service treats as no opinion.
+        self.scopes: set[str] = set(scopes or ())
+
+    async def granted_scopes(self, account_id: str) -> set[str]:
+        return self.scopes
 
     async def get_access_token(self, account_id: str) -> str:
         return self.tokens[min(self.refresh_calls, len(self.tokens) - 1)]
@@ -374,3 +379,107 @@ async def test_malformed_date_is_refused(config):
 
     with pytest.raises(DateRangeError):
         service.resolve_range(Resource.DAILY_SLEEP, "last tuesday", None)
+
+
+# ── Scope preflight ───────────────────────────────────────────────────────
+#
+# Oura answers 401 for a missing scope, so an ungranted collection costs a
+# round trip and looks like an auth failure. When the stored token tells us the
+# scope was never granted, refuse locally instead.
+
+
+async def test_an_ungranted_scope_is_refused_without_calling_oura(config):
+    client = RecordingClient()
+    tokens = StubTokenService(scopes={"daily", "personal"})
+    service, _ = build_service(config, client, tokens=tokens)
+
+    with pytest.raises(OuraPermissionError) as excinfo:
+        await service.get_records(Resource.DAILY_RESILIENCE, RANGE)
+
+    assert client.calls == [], "a request went out for a scope we know is missing"
+    assert "stress" in str(excinfo.value)
+
+
+async def test_a_granted_scope_still_reaches_oura(config):
+    client = RecordingClient()
+    tokens = StubTokenService(scopes={"daily", "stress"})
+    service, _ = build_service(config, client, tokens=tokens)
+
+    await service.get_records(Resource.DAILY_RESILIENCE, RANGE)
+
+    assert len(client.calls) == 1
+
+
+async def test_unknown_scopes_do_not_block_anything(config):
+    """An older token record has no scopes; Oura decides, not us."""
+    client = RecordingClient()
+    tokens = StubTokenService(scopes=set())
+    service, _ = build_service(config, client, tokens=tokens)
+
+    await service.get_records(Resource.DAILY_RESILIENCE, RANGE)
+
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("resource", "scope"),
+    [
+        (Resource.DAILY_RESILIENCE, "stress"),
+        (Resource.DAILY_CARDIOVASCULAR_AGE, "heart_health"),
+        (Resource.VO2_MAX, "heart_health"),
+        (Resource.RING_CONFIGURATION, "ring_configuration"),
+        (Resource.RING_BATTERY_LEVEL, "ring_configuration"),
+        (Resource.DAILY_SPO2, "spo2"),
+        (Resource.HEARTRATE, "heartrate"),
+        (Resource.WORKOUT, "workout"),
+        (Resource.SESSION, "session"),
+        (Resource.ENHANCED_TAG, "tag"),
+        (Resource.PERSONAL_INFO, "personal"),
+    ],
+)
+def test_each_resource_declares_the_scope_oura_actually_demands(resource, scope):
+    """Verified by probing every endpoint with a live token.
+
+    Three of these -- stress, heart_health, ring_configuration -- are absent
+    from Oura's OpenAPI spec entirely.
+    """
+    from oura_mcp.models.resources import spec_for
+
+    assert spec_for(resource).scope == scope
+
+
+async def test_a_summary_skips_only_the_ungranted_resource(config):
+    """One missing scope must not cost a round trip on every summary call."""
+    from oura_mcp.services.summary_service import SummaryService
+
+    client = RecordingClient()
+    tokens = StubTokenService(
+        scopes={"daily", "spo2", "workout", "personal", "heartrate", "tag", "session"}
+    )
+    service, _ = build_service(config, client, tokens=tokens)
+
+    summary = await SummaryService(service).build(RANGE)
+
+    requested = {call[0] for call in client.calls}
+    assert Resource.DAILY_RESILIENCE not in requested
+    assert Resource.DAILY_SLEEP in requested
+    assert any("daily_resilience" in note for note in summary.unavailable)
+
+
+async def test_the_extapi_prefix_oura_returns_is_stripped(config):
+    """Oura echoes scopes back as `extapi:daily`; the stored form must match."""
+    from oura_mcp.services.token_service import TokenService
+    from tests.conftest import FakeAuditRepository, FakeOAuthClient, FakeTokenRepository, make_token
+
+    repository = FakeTokenRepository(
+        make_token(scopes=["extapi:daily", "extapi:stress"])
+    )
+    tokens = TokenService(
+        repository=repository,  # type: ignore[arg-type]
+        oauth_client=FakeOAuthClient(),  # type: ignore[arg-type]
+        redis=FakeRedis(),  # type: ignore[arg-type]
+        audit=AuditService(FakeAuditRepository()),  # type: ignore[arg-type]
+        config=config,
+    )
+
+    assert await tokens.granted_scopes("default") == {"daily", "stress"}

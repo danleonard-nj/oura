@@ -74,6 +74,7 @@ def parse(path: Path) -> tuple[dict[str, str], list[str]]:
     """Parse the file the way kubectl does, collecting syntax faults."""
     values: dict[str, str] = {}
     errors: list[str] = []
+    seen: dict[str, int] = {}
 
     for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         line = raw.strip()
@@ -105,6 +106,14 @@ def parse(path: Path) -> tuple[dict[str, str], list[str]]:
                 "Remove them."
             )
 
+        if key in seen:
+            # kubectl and our own parser both take the last assignment, so a
+            # duplicate silently wins over the one you were looking at.
+            errors.append(
+                f"line {number}: {key} is set again here, first at line {seen[key]}. "
+                "The last assignment wins silently -- delete one."
+            )
+        seen[key] = number
         values[key] = stripped
 
     return values, errors

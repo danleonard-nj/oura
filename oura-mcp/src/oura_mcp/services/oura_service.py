@@ -166,6 +166,12 @@ class OuraService:
         refreshed = False
         attempt = 0
 
+        if (denied := await self._scope_denial(resource)) is not None:
+            await self._audit_request(
+                resource, date_range, started, status="error", error=denied
+            )
+            raise denied
+
         while True:
             attempt += 1
             token = await self._tokens.get_access_token(self._account_id)
@@ -226,6 +232,31 @@ class OuraService:
 
             await self._audit_request(resource, date_range, started, status="ok")
             return result
+
+    async def _scope_denial(self, resource: Resource) -> OuraPermissionError | None:
+        """Refuse locally when the granted scopes cannot cover this resource.
+
+        Oura answers 401 for a missing scope, so without this every call to an
+        unreachable collection costs a round trip and looks like an auth
+        failure. `oura_summary` fans out over several collections, so one
+        ungranted scope would otherwise tax every summary.
+
+        Unknown scopes mean no opinion: if the stored token records none, the
+        request goes out and Oura decides.
+        """
+        granted = await self._tokens.granted_scopes(self._account_id)
+        if not granted:
+            return None
+
+        required = spec_for(resource).scope
+        if required in granted:
+            return None
+
+        return OuraPermissionError(
+            f"Access to {resource.value} needs the '{required}' Oura scope, which this "
+            f"connection was not granted. Reconnect the account with '{required}' in "
+            "OURA_SCOPES. Not requested upstream, because Oura would reject it."
+        )
 
     def _should_retry(self, error: OuraError, attempt: int) -> bool:
         if attempt >= self._max_attempts:

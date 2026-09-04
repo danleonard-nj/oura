@@ -72,6 +72,18 @@ class TokenService:
     async def status(self, account_id: str) -> ConnectionStatus:
         return await self._repository.status(account_id)
 
+    async def granted_scopes(self, account_id: str) -> set[str]:
+        """Scopes Oura actually granted, normalised.
+
+        Oura echoes them back prefixed -- `extapi:daily` rather than `daily` --
+        so the prefix is stripped to match what we requested. An empty set
+        means unknown, and callers must treat that as "do not block".
+        """
+        token = await self._repository.get(account_id)
+        if token is None:
+            return set()
+        return {scope.removeprefix("extapi:") for scope in token.scopes}
+
     # ── Writes ────────────────────────────────────────────────────────────
 
     async def store_grant(self, account_id: str, grant: TokenGrant) -> OuraToken:
