@@ -19,7 +19,7 @@ from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from oura_mcp.infrastructure.logging import (
+from oura_common.infrastructure.logging import (
     get_logger,
     new_correlation_id,
     set_correlation_id,

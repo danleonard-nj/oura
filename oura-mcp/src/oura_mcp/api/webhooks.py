@@ -16,8 +16,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from oura_common.infrastructure.logging import get_logger
+
 from oura_mcp.api.dependencies import resolve
-from oura_mcp.infrastructure.logging import get_logger
 from oura_mcp.models.webhooks import WebhookEvent
 from oura_mcp.services.webhook_service import WebhookService, WebhookVerificationError
 

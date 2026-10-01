@@ -1,4 +1,10 @@
 # syntax=docker/dockerfile:1
+#
+# Build context is the repo root (see deploy.bat), not this directory:
+# oura_mcp imports from the sibling oura-common/ shared source tree, which is
+# not an installed package (see oura-common/oura_common/__init__.py) -- it's
+# put on the venv's import path here via a .pth file, the same mechanism
+# `pip install -e` uses under the hood.
 
 # ── Build stage ───────────────────────────────────────────────────────────
 # Dependencies are installed into a virtualenv in their own layer, so editing
@@ -12,13 +18,15 @@ WORKDIR /build
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-COPY pyproject.toml ./
-COPY src/oura_mcp/__init__.py src/oura_mcp/__init__.py
+COPY oura-mcp/pyproject.toml ./
+COPY oura-mcp/src/oura_mcp/__init__.py src/oura_mcp/__init__.py
 RUN python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install .
 
-COPY src/ src/
-RUN python -m pip install --no-deps .
+COPY oura-mcp/src/ src/
+RUN python -m pip install --no-deps . && \
+    SITE_PACKAGES="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" && \
+    echo "/opt/oura-common" > "$SITE_PACKAGES/oura-common.pth"
 
 
 # ── Runtime stage ─────────────────────────────────────────────────────────
@@ -34,6 +42,7 @@ RUN groupadd --system --gid 10001 oura && \
     useradd --system --uid 10001 --gid oura --no-create-home --shell /usr/sbin/nologin oura
 
 COPY --from=build /opt/venv /opt/venv
+COPY oura-common/src/oura_common /opt/oura-common/oura_common
 
 WORKDIR /app
 USER 10001:10001

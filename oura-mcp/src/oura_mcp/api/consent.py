@@ -16,9 +16,10 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
+from oura_common.infrastructure.logging import get_logger
+
 from oura_mcp.api.dependencies import resolve
 from oura_mcp.config import Config
-from oura_mcp.infrastructure.logging import get_logger
 from oura_mcp.services.mcp_auth_service import (
     CONSENT_PATH,
     ConsentError,

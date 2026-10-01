@@ -16,8 +16,9 @@ import pytest
 import httpx2
 from cryptography.fernet import Fernet
 
+from oura_common.models.tokens import OuraToken, TokenGrant
+
 from oura_mcp.config import Config
-from oura_mcp.models.tokens import OuraToken, TokenGrant
 
 @pytest.fixture
 def config() -> Config:
@@ -122,7 +123,7 @@ class FakeTokenRepository:
         return stored
 
     async def status(self, account_id: str):
-        from oura_mcp.models.tokens import ConnectionStatus
+        from oura_common.models.tokens import ConnectionStatus
 
         if self.token is None:
             return ConnectionStatus(account_id=account_id, connected=False)
@@ -280,6 +281,6 @@ def request_log_repository() -> FakeRequestLogRepository:
 
 @pytest.fixture
 def audit_service(audit_repository: FakeAuditRepository):
-    from oura_mcp.services.audit_service import AuditService
+    from oura_common.services.audit_service import AuditService
 
     return AuditService(audit_repository)  # type: ignore[arg-type]

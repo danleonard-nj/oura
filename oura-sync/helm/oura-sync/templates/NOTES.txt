@@ -1,0 +1,40 @@
+oura-sync {{ .Chart.AppVersion }} is deployed as {{ include "oura-sync.fullname" . }}.
+
+1. Check it came up:
+
+     kubectl rollout status deployment/{{ include "oura-sync.fullname" . }} -n {{ .Release.Namespace }}
+     kubectl port-forward svc/{{ include "oura-sync.fullname" . }} 8000:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+     curl -s localhost:8000/ready | jq
+
+   /ready reports Mongo and Redis. Both must be reachable before the pod
+   joins the Service.
+
+2. This service has no ingress and no public endpoint by design -- it is
+   reached through the internal API gateway or from inside the cluster
+   (oura-mcp). Point your external cron scheduler's gateway route, and
+   oura-mcp's SYNC_SERVICE_BASE_URL, at it.
+
+3. Trigger a sync run by hand to confirm the wiring end to end:
+
+     curl -sX POST http://localhost:8000/internal/sync/run \
+       -H "Authorization: Bearer $(your token minting command)" | jq
+
+{{- if eq (include "oura-sync.createSecret" .) "true" }}
+
+NOTE: this release rendered its own Secret from inline values, so those
+credentials are stored in the Helm release history in plain text. For anything
+long-lived, create the Secret separately and set `existingSecret` instead.
+{{- else if not .Values.existingSecret }}
+
+WARNING: no `existingSecret` and no inline secret values. The pod has no
+credentials and will fail to start with a configuration error. Set
+`existingSecret` to a Secret containing OURA_CLIENT_ID, OURA_CLIENT_SECRET,
+OURA_REDIRECT_URI, TOKEN_ENCRYPTION_KEY, MONGODB_URI, REDIS_URL, AAD_TENANT_ID
+and AAD_AUDIENCE.
+{{- end }}
+
+{{- if gt (int .Values.replicaCount) 1 }}
+
+Running {{ .Values.replicaCount }} replicas. The token refresh lock is a Redis
+lock shared with oura-mcp, so any replica of either service can safely refresh.
+{{- end }}

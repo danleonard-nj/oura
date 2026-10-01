@@ -32,19 +32,28 @@ from httpx2 import AsyncClient
 from redis.asyncio import Redis
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.routing import Route
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
 
-from oura_mcp.api import consent, oauth, routes, webhooks
+from oura_common.infrastructure.logging import configure_logging, get_logger
+from oura_common.infrastructure.mongo import ensure_indexes as _ensure_common_indexes
+
+from oura_mcp.api import consent, home, oauth, routes, webhooks
 from oura_mcp.api.auth import BearerTokenMiddleware
 from oura_mcp.api.dependencies import CorrelationIdMiddleware
 from oura_mcp.config import Config, load_config
 from oura_mcp.container import build_provider
-from oura_mcp.infrastructure.logging import configure_logging, get_logger
-from oura_mcp.infrastructure.mongo import ensure_indexes
+from oura_mcp.infrastructure.mongo import ensure_indexes as _ensure_mcp_indexes
 from oura_mcp.mcp.context import ToolContext
 from oura_mcp.mcp.server import build_mcp_app, build_mcp_server, build_oauth_routes
 
 logger = get_logger(__name__)
+
+
+async def ensure_indexes(database: AsyncDatabase) -> None:
+    """The shared oura-common indexes, plus this app's own (webhooks, request log)."""
+    await _ensure_common_indexes(database)
+    await _ensure_mcp_indexes(database)
 
 
 def create_app(config: Config | None = None) -> Starlette:
@@ -112,6 +121,8 @@ def create_app(config: Config | None = None) -> Starlette:
 
     return Starlette(
         routes=[
+            Route("/", home.index, methods=["GET"]),
+            Mount("/static", app=StaticFiles(directory=home.STATIC_DIR), name="static"),
             Route(config.mcp_path, endpoint=guarded_mcp),
             *oauth_routes,
             *(consent.ROUTES if config.mcp_oauth_enabled else []),

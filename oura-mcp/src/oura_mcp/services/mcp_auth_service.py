@@ -36,11 +36,12 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
+from oura_common.infrastructure.logging import get_correlation_id, get_logger
+from oura_common.models.audit import AuditAction, AuditEvent
+from oura_common.services.audit_service import AuditService
+
 from oura_mcp.config import Config
-from oura_mcp.infrastructure.logging import get_correlation_id, get_logger
-from oura_mcp.models.audit import AuditAction, AuditEvent
 from oura_mcp.repositories.oauth_repository import OAuthRepository
-from oura_mcp.services.audit_service import AuditService
 
 logger = get_logger(__name__)
 

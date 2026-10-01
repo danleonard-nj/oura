@@ -8,10 +8,11 @@ import json
 
 import pytest
 
-from oura_mcp.models.resources import Resource
+from oura_common.models.resources import Resource
+from oura_common.services.audit_service import AuditService
+from oura_common.services.cache_service import CacheService
+
 from oura_mcp.models.webhooks import WebhookEvent
-from oura_mcp.services.audit_service import AuditService
-from oura_mcp.services.cache_service import CacheService
 from oura_mcp.services.webhook_service import WebhookService, WebhookVerificationError
 from tests.conftest import (
     FakeAuditRepository,

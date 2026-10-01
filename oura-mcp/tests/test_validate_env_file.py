@@ -1,5 +1,10 @@
 """The env-file validator that guards `kubectl create secret --from-env-file`.
 
+This script (and the shared Secret it validates) live at the repo root, not
+under oura-mcp -- oura-mcp and oura-sync run in the same namespace and share
+one Secret (see ../../push-secret.bat), so there is one validator, not two.
+This test file is the only copy; oura-sync does not have its own.
+
 Each case here mirrors something kubectl actually does: it keeps quotes, it
 keeps trailing whitespace, and it has no idea which keys belong in a Secret
 rather than a ConfigMap. All three fail silently in the cluster, which is why
@@ -14,7 +19,8 @@ from pathlib import Path
 
 import pytest
 
-_MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "validate_env_file.py"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_MODULE_PATH = _REPO_ROOT / "scripts" / "validate_env_file.py"
 _spec = importlib.util.spec_from_file_location("validate_env_file", _MODULE_PATH)
 validate_env_file = importlib.util.module_from_spec(_spec)
 sys.modules["validate_env_file"] = validate_env_file
@@ -23,6 +29,7 @@ _spec.loader.exec_module(validate_env_file)
 COMPLETE = """\
 OURA_CLIENT_ID=cid
 OURA_CLIENT_SECRET=csecret
+OURA_REDIRECT_URI=https://oura.test/oauth/callback
 MCP_API_KEY=key
 TOKEN_ENCRYPTION_KEY=fernet
 MONGODB_URI=mongodb://mongo:27017
@@ -189,7 +196,7 @@ def test_no_value_is_ever_printed(tmp_path, capsys):
 
 def test_the_committed_template_parses_and_documents_every_required_key(tmp_path):
     """`.env.example` is the single template; it must stay in step with REQUIRED."""
-    example = Path(__file__).resolve().parents[1] / ".env.example"
+    example = _REPO_ROOT / ".env.example"
     values, problems = validate_env_file.parse(example)
 
     assert problems == [], problems

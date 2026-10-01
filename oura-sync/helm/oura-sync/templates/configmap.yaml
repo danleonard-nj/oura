@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "oura-sync.fullname" . }}
+  labels:
+    {{- include "oura-sync.labels" . | nindent 4 }}
+data:
+  HOST: "0.0.0.0"
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  MONGODB_DATABASE: {{ .Values.config.mongodbDatabase | quote }}
+  OURA_ACCOUNT_ID: {{ .Values.config.ouraAccountId | quote }}
+  SYNC_RESOURCES: {{ join "," .Values.config.syncResources | quote }}

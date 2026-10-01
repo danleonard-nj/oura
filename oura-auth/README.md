@@ -14,10 +14,18 @@ needs to run before either is deployed.
 cd oura-auth
 python -m venv .venv && .venv/Scripts/activate     # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
+cp ../.env.example ../.env
 ```
 
-Fill in `.env`. Three values matter most:
+**The `.env` lives at the repo root**, shared with oura-mcp and oura-sync --
+see oura-mcp's README for why. This script reads whatever `--env-file` you
+pass it (default `./.env`), so point it at the shared one explicitly:
+
+```bash
+python oura_auth.py connect --env-file ../.env
+```
+
+Fill in the root `.env`. Three values matter most:
 
 - `OURA_CLIENT_ID` / `OURA_CLIENT_SECRET` — from
   <https://cloud.ouraring.com/oauth/applications>.
@@ -36,7 +44,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ## Usage
 
 ```bash
-python oura_auth.py connect
+python oura_auth.py connect --env-file ../.env
 ```
 
 Opens your browser to Oura's consent screen, captures the redirect on
@@ -98,4 +106,4 @@ Two rules any writer must follow:
 - No command prints an access token, refresh token or authorization code.
 - Token-endpoint failures report only Oura's error code, never the submitted
   grant.
-- `.env` is gitignored. Keep it that way.
+- The shared root `.env` is gitignored. Keep it that way.

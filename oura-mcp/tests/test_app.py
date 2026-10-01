@@ -17,12 +17,13 @@ from datetime import UTC, datetime
 import pytest
 from starlette.testclient import TestClient
 
-from oura_mcp.clients.oura_client import OuraApiClient, WebhookSubscriptionClient
+from oura_common.clients.oura_client import OuraApiClient, WebhookSubscriptionClient
+from oura_common.models.resources import Resource
+from oura_common.repositories.audit_repository import AuditRepository
+from oura_common.repositories.token_repository import TokenRepository
+
 from oura_mcp.config import Config
-from oura_mcp.models.resources import Resource
-from oura_mcp.repositories.audit_repository import AuditRepository
 from oura_mcp.repositories.request_log_repository import RequestLogRepository
-from oura_mcp.repositories.token_repository import TokenRepository
 from oura_mcp.repositories.webhook_repository import WebhookRepository
 from tests.conftest import (
     FakeAuditRepository,
@@ -489,7 +490,7 @@ def test_summary_joins_resources_by_day(client):
 
 
 def test_summary_with_unavailable_resilience_is_audited_as_partial(client, fakes, monkeypatch):
-    from oura_mcp.models.errors import OuraPermissionError
+    from oura_common.models.errors import OuraPermissionError
 
     original = fakes["oura"].fetch_range
 

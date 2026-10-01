@@ -53,7 +53,7 @@ config:
 # ── Secrets ───────────────────────────────────────────────────────────────
 # Preferred: reference a Secret you already manage.
 #
-#   existingSecret: oura-mcp
+#   existingSecret: oura-shared   # shared with oura-sync -- see ../../push-secret.bat
 #
 # The Secret must contain these keys:
 #   OURA_CLIENT_ID, OURA_CLIENT_SECRET, MCP_API_KEY, TOKEN_ENCRYPTION_KEY,

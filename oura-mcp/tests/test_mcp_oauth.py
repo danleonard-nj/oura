@@ -15,8 +15,9 @@ from mcp.server.auth.provider import AuthorizationParams
 from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyUrl
 
+from oura_common.services.audit_service import AuditService
+
 from oura_mcp.config import Config
-from oura_mcp.services.audit_service import AuditService
 from oura_mcp.services.mcp_auth_service import (
     MCP_SCOPE,
     ConsentError,

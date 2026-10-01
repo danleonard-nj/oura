@@ -1,0 +1,13 @@
+apiVersion: v2
+name: oura-sync
+description: Polls Oura resources the live API cannot show history for (ring config/firmware, battery level, profile)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - oura
+  - health
+  - sync
+maintainers:
+  - name: Dan Leonard
+    email: dcl525@gmail.com

@@ -6,12 +6,13 @@ import asyncio
 from datetime import date
 from typing import Any
 
-from oura_mcp.infrastructure.logging import get_logger
-from oura_mcp.models.dates import DateRange, parse_date
-from oura_mcp.models.errors import OuraError, OuraPermissionError
-from oura_mcp.models.resources import Resource
+from oura_common.infrastructure.logging import get_logger
+from oura_common.models.dates import DateRange, parse_date
+from oura_common.models.errors import OuraError, OuraPermissionError
+from oura_common.models.resources import Resource
+from oura_common.services.oura_service import OuraService
+
 from oura_mcp.models.results import DaySummary, Summary
-from oura_mcp.services.oura_service import OuraService
 
 logger = get_logger(__name__)
 

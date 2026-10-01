@@ -70,11 +70,27 @@ src/oura_mcp/
   container.py        DEPI composition root — every registration lives here
   api/                thin route handlers, auth middleware, consent screen
   mcp/                MCP server construction and the tool surface
-  services/           all business and integration logic
-  repositories/       Mongo persistence (tokens, audit, webhooks, oauth)
-  clients/            async Oura HTTP clients (httpx2)
-  infrastructure/     logging, crypto, Mongo, Redis
-  models/             domain types, date validation, result shapes
+  services/           MCP-specific business logic (summary, webhooks, MCP OAuth, history)
+  repositories/       Mongo persistence for this app's own collections (webhooks, oauth, request log)
+  clients/            oura-sync HTTP client
+  infrastructure/     this app's own collections/indexes (webhook_events, request_log)
+  models/             MCP tool result shapes, webhook and request-log models
+
+../oura-common/src/oura_common/   shared with oura-sync — see that project's README
+  config.py, container.py     CommonConfig / register_common, both subclassed/called here
+  clients/, services/         OuraApiClient, OuraOAuthClient, TokenService, CacheService, OuraService
+  repositories/                TokenRepository, AuditRepository (oauth_tokens, audit_events)
+  infrastructure/, models/     crypto, logging, Mongo/Redis, Oura domain types, Azure AD gateway auth
+```
+
+`oura-common` is a plain shared source tree, not an installed package: both
+services import it directly (`import oura_common...`), reached via pytest's
+`pythonpath` setting for tests and Docker's `.pth`-file mechanism for the
+built image (see the Dockerfile). **Running the app directly (not under
+pytest)** needs the sibling directory on `PYTHONPATH`:
+
+```bash
+PYTHONPATH=../oura-common/src hypercorn "oura_mcp.app:create_app()" --bind 0.0.0.0:8000 --reload
 ```
 
 Entry points stay thin — accept input, call an injected service, return the
@@ -175,8 +191,18 @@ Requires Python 3.12+, plus a reachable MongoDB and Redis.
 cd oura-mcp
 python -m venv .venv && .venv/Scripts/activate     # Linux/macOS: source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env
+cp ../.env.example ../.env
 ```
+
+**The `.env` lives at the repo root, not in this directory** — oura-mcp and
+oura-sync run in the same namespace, share several values byte-for-byte
+(`OURA_CLIENT_ID`/`SECRET`, `TOKEN_ENCRYPTION_KEY`, `MONGODB_URI`,
+`REDIS_URL`), and keeping two near-duplicate `.env` files in sync by hand was
+the actual maintenance problem. `load_dotenv()` (called with no path in
+`app.py`) finds it automatically: it walks **up** from `app.py`'s own
+location looking for a `.env`, not from your shell's current directory, so
+this works regardless of where you `cd` from — as long as neither `oura-mcp/`
+nor `oura-sync/` has its own `.env` shadowing the root one.
 
 Generate the two secrets:
 
@@ -336,16 +362,19 @@ Important optional ones:
 | `OURA_WEBHOOK_VERIFICATION_TOKEN` | —                  | Required to accept webhook subscriptions                                                         |
 | `LOG_LEVEL`                       | `INFO`             |                                                                                                  |
 | `HOST` / `PORT`                   | `0.0.0.0` / `8000` |                                                                                                  |
+| `SYNC_SERVICE_BASE_URL`           | —                  | Enables `oura_resource_history`; see [oura-sync integration](#oura-sync-integration)             |
+| `AAD_TENANT_ID` / `AAD_CLIENT_ID` / `AAD_CLIENT_SECRET` / `AAD_SYNC_SCOPE` | — | This deployment's own Azure AD app registration, used to call oura-sync |
 
 Tuning knobs (executor size, timeouts, retry budget, range caps, cache TTLs,
-lock timings) are listed with their defaults in `.env.example`.
+lock timings) are listed with their defaults in the repo-root `.env.example`,
+alongside oura-sync's own variables.
 
 ---
 
 ## Running locally
 
 ```bash
-hypercorn "oura_mcp.app:create_app()" --bind 0.0.0.0:8000 --reload
+PYTHONPATH=../oura-common/src hypercorn "oura_mcp.app:create_app()" --bind 0.0.0.0:8000 --reload
 ```
 
 Then:
@@ -448,6 +477,7 @@ the MCP surface.
 | `oura_tags`               | User-entered tags                                                                   | 14 days        |
 | `oura_ring_info`          | Ring model, size, firmware                                                          | 30 days        |
 | `oura_personal_info`      | Age, sex, height, weight                                                            | —              |
+| `oura_resource_history`   | Historical snapshots of ring config/firmware, battery level, or profile — see below | all history    |
 | `oura_query`              | Any collection by name, for the long tail                                           | 7 days         |
 
 `oura_summary` is the one to reach for first: it fans out across six
@@ -460,6 +490,15 @@ a subscription — is reported in `unavailable` rather than failing the summary.
 per-period sessions), `sleep_time`, `tag` (legacy format), `rest_mode_period`
 and `ring_battery_level`. Keeping them behind one tool avoids five more
 schemas for rarely-asked questions.
+
+`oura_resource_history` answers what the live Oura API cannot: it has no
+history endpoint for things like ring configuration/firmware, and while
+`ring_battery_level` accepts a date range, Oura does not durably retain a long
+battery history behind it. `oura-sync` polls those three resources on a
+cadence and stores only the snapshots that changed; this tool calls through
+to it (see `services/history_service.py`, `clients/sync_client.py`).
+Unconfigured (no `SYNC_SERVICE_BASE_URL`/AAD settings) it reports a clear
+"not configured" error rather than failing to start.
 
 Every tool returns a typed Pydantic model, so clients get real structured
 content and a real output schema — not stringified JSON.
@@ -522,7 +561,7 @@ your cluster and takes their URLs from a Secret.
 helm upgrade --install oura-mcp ./helm/oura-mcp \
   --namespace default \
   --set image.tag=0.1.0 \
-  --set existingSecret=oura-mcp \
+  --set existingSecret=oura-shared \
   --set ingress.enabled=true \
   --set ingress.hostname=oura.example.com \
   --set ingress.tls.enabled=true \
@@ -604,16 +643,16 @@ redirect URI is registered with Oura against the service's own hostname.
 
 ## Kubernetes secrets
 
-Create the Secret out of band and point the chart at it with `existingSecret`.
-The chart can render its own from inline values, but those end up in the Helm
-release history in plain text.
-
-The simplest route is an env file:
+**This is a shared Secret, `oura-shared`, managed from the repo root, not
+from this directory.** oura-mcp and oura-sync run in the same namespace and
+both set `existingSecret: oura-shared` in their `values.prod.yaml`, so there
+is one Secret and one push workflow for both, not two to keep in sync.
 
 ```bash
-cp .env.prod.example .env.prod    # then fill it in
-push-secret.bat                   # validate, create the Secret, restart the pods
-push-secret.bat --overwrite       # validate, update the Secret, restart the pods
+cd ..                              # the repo root
+cp .env.example .env.prod          # then fill it in
+push-secret.bat                    # validate, create the Secret, restart BOTH deployments
+push-secret.bat --overwrite        # validate, update the Secret, restart BOTH deployments
 ```
 
 `.env.prod` is gitignored. The script validates before pushing, because
@@ -624,10 +663,11 @@ push-secret.bat --overwrite       # validate, update the Secret, restart the pod
 - **Trailing whitespace is preserved.** A stray space after `MCP_API_KEY`
   means every request 401s, with nothing in the logs to explain it.
 
-It also rejects ConfigMap keys such as `PUBLIC_HOST`. The deployment lists the
-Secret _after_ the ConfigMap in `envFrom`, so anything in this file silently
-overrides the chart, and a stale `PUBLIC_HOST` would quietly break OAuth
-discovery. Keep the file to secrets only.
+It also rejects ConfigMap keys such as `PUBLIC_HOST`. Each deployment lists
+its Secret _after_ its ConfigMap in `envFrom`, so anything in this file
+silently overrides that chart's ConfigMap-derived values, and a stale
+`PUBLIC_HOST` would quietly break OAuth discovery. Keep the file to secrets
+only.
 
 Run the check alone at any time:
 
@@ -635,10 +675,11 @@ Run the check alone at any time:
 python scripts/validate_env_file.py .env.prod
 ```
 
-Or use explicit flags instead, if you prefer:
+Or use explicit flags instead, if you prefer -- this creates the same
+`oura-shared` Secret both charts expect:
 
 ```bash
-kubectl create secret generic oura-mcp   --namespace oura   --from-literal=OURA_CLIENT_ID='...'   --from-literal=OURA_CLIENT_SECRET='...'   --from-literal=MCP_API_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(48))')"   --from-literal=TOKEN_ENCRYPTION_KEY="$(python -c 'from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())')"   --from-literal=MONGODB_URI='mongodb://user:pass@mongo-internal.default.svc.cluster.local:27017/?authSource=admin'   --from-literal=REDIS_URL='redis://redis-internal.default.svc.cluster.local:6379/0'   --from-literal=OURA_WEBHOOK_VERIFICATION_TOKEN="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"   --from-literal=MCP_OWNER_PASSWORD="$(python -c 'import secrets;print(secrets.token_urlsafe(48))')"
+kubectl create secret generic oura-shared   --namespace oura   --from-literal=OURA_CLIENT_ID='...'   --from-literal=OURA_CLIENT_SECRET='...'   --from-literal=OURA_REDIRECT_URI='https://oura.example.com/oauth/callback'   --from-literal=MCP_API_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(48))')"   --from-literal=TOKEN_ENCRYPTION_KEY="$(python -c 'from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())')"   --from-literal=MONGODB_URI='mongodb://user:pass@mongo-internal.default.svc.cluster.local:27017/?authSource=admin'   --from-literal=REDIS_URL='redis://redis-internal.default.svc.cluster.local:6379/0'   --from-literal=OURA_WEBHOOK_VERIFICATION_TOKEN="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"   --from-literal=MCP_OWNER_PASSWORD="$(python -c 'import secrets;print(secrets.token_urlsafe(48))')"   --from-literal=AAD_TENANT_ID='...'   --from-literal=AAD_AUDIENCE='api://<oura-sync-app-id>'
 ```
 
 `MCP_OWNER_PASSWORD` is optional: omit it and the server runs bearer-token
@@ -646,15 +687,19 @@ only. Include it to enable [MCP OAuth](#mcp-oauth), which is what ChatGPT
 needs. Read it back when you need it at the consent screen:
 
 ```bash
-kubectl get secret oura-mcp -n oura -o jsonpath='{.data.MCP_OWNER_PASSWORD}' | base64 -d
+kubectl get secret oura-shared -n oura -o jsonpath='{.data.MCP_OWNER_PASSWORD}' | base64 -d
 ```
 
 A Secret change on its own restarts nothing — `envFrom` values are read at
-container start. `push-secret.bat` does the rollout restart for you.
+container start. `push-secret.bat` restarts both `oura-mcp` and `oura-sync`
+for you.
 
 **Keep `TOKEN_ENCRYPTION_KEY` safe.** Rotating it makes every stored token
 undecryptable and the account has to reconnect. The service says exactly that
-if it happens rather than failing obscurely.
+if it happens rather than failing obscurely. Because it's a shared Secret,
+rotating any value in it restarts both services, not just this one --
+harmless (both read the same values), but worth knowing before you rotate
+something on a whim.
 
 ---
 
@@ -997,6 +1042,27 @@ curl -sX POST https://oura.dan-leonard.com/revoke -d "token=<access-or-refresh-t
 Or drop the client's record from `oauth_clients` and delete its refresh tokens
 from `oauth_refresh_tokens`. Rotating `MCP_OWNER_PASSWORD` prevents new
 authorizations but does not revoke existing tokens.
+
+## oura-sync integration
+
+`oura_resource_history` calls a separate service, `oura-sync`, which polls
+`ring_configuration`, `ring_battery_level` and `personal_info` on a cadence
+(triggered externally, not by this service) and stores only the snapshots
+that changed. This is how the MCP surface can answer "when did my firmware
+update" or "chart my battery level this month" — things the live Oura API has
+no way to answer itself.
+
+The two services authenticate to each other the same way the other internal
+services here do: an Azure AD client-credentials token, scoped to the
+target's Application ID URI, presented through the shared API gateway. Set
+`AAD_TENANT_ID`, `AAD_CLIENT_ID`, `AAD_CLIENT_SECRET` (this deployment's own
+app registration) and `AAD_SYNC_SCOPE` (oura-sync's `api://<app-id>/.default`)
+to enable it; leave them unset and `oura_resource_history` reports itself
+unconfigured rather than failing to start. See `oura_common.azure_ad` for the
+token-fetch/caching implementation, shared with oura-sync's own inbound
+validation.
+
+---
 
 ## Limitations
 

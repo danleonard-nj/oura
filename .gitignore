@@ -2,3 +2,10 @@ oura-mcp/.env.example
 oura-mcp/.dockerignore
 oura-mcp/.env.example
 oura-mcp/values.prod.yaml
+
+# Shared local-dev/prod env files (see .env.example) -- read by oura-mcp,
+# oura-sync and oura-auth, none of which have their own .env anymore.
+/.env
+/.env.prod
+/.env.prod.bak-scopes
+/.env.bak-scopes

@@ -11,10 +11,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse
 from starlette.routing import Route
 
+from oura_common.infrastructure.logging import get_logger
+from oura_common.models.errors import TokenRefreshError
+from oura_common.services.oauth_service import OAuthService, OAuthStateError
+
 from oura_mcp.api.dependencies import json_error, resolve
-from oura_mcp.infrastructure.logging import get_logger
-from oura_mcp.models.errors import TokenRefreshError
-from oura_mcp.services.oauth_service import OAuthService, OAuthStateError
 
 logger = get_logger(__name__)
 

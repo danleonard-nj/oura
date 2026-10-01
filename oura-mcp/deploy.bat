@@ -14,7 +14,9 @@ echo Building with tag: %TAG%
 
 REM No ARTIFACT_FEED build args: oura-mcp installs only from public PyPI,
 REM so the private feed token is not needed here.
-docker build -t azureks.azurecr.io/oura/oura-mcp:%TAG% -t azureks.azurecr.io/oura/oura-mcp:latest -f Dockerfile .
+REM Build context is the repo root (..), not this directory: the Dockerfile
+REM also copies the sibling oura-common/ shared source tree.
+docker build -t azureks.azurecr.io/oura/oura-mcp:%TAG% -t azureks.azurecr.io/oura/oura-mcp:latest -f Dockerfile ..
 if errorlevel 1 exit /b 1
 
 echo Pushing tagged image: %TAG%

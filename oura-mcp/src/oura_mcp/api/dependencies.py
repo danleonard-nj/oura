@@ -11,14 +11,15 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from oura_mcp.api.auth import CORRELATION_HEADER, require_api_key
-from oura_mcp.config import Config
-from oura_mcp.infrastructure.logging import (
+from oura_common.infrastructure.logging import (
     get_correlation_id,
     get_logger,
     new_correlation_id,
     set_correlation_id,
 )
+
+from oura_mcp.api.auth import CORRELATION_HEADER, require_api_key
+from oura_mcp.config import Config
 from oura_mcp.models.request_log import RequestLogEntry
 from oura_mcp.repositories.request_log_repository import RequestLogRepository
 

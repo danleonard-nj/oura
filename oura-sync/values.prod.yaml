@@ -1,0 +1,13 @@
+# Production overrides for the oura namespace.
+# Non-secret only: credentials come from the `oura-shared` Secret in-cluster,
+# shared with oura-mcp since both run in this same namespace -- see
+# ../push-secret.bat. deploy.bat supplies image.repository and image.tag.
+
+replicaCount: 1
+
+existingSecret: oura-shared
+
+config:
+  logLevel: INFO
+  mongodbDatabase: oura_mcp
+  ouraAccountId: default

@@ -22,6 +22,7 @@ dependencies = [
     "pydantic-settings>=2.5",
     "pydepi>=0.1.0",
     "python-dotenv>=1.0",
+    "pyjwt[crypto]>=2.9",
 ]
 
 [project.optional-dependencies]
@@ -33,8 +34,16 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+oura_mcp = ["static/*.html", "static/*.css", "static/*.js"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+# oura-common is a plain shared source tree, not an installed package (see
+# oura-common/oura_common/__init__.py) -- this is how pytest finds it. Running
+# the app itself (not under pytest) needs the same directory on PYTHONPATH;
+# see README.md.
+pythonpath = ["../oura-common/src"]

@@ -1,0 +1,53 @@
+:root {
+  font-family: Tahoma, "MS Sans Serif", Arial, sans-serif;
+  color: #171717;
+  background: #008080;
+  font-synthesis: none;
+  --gray: #c0c0c0;
+  --raised: inset 1px 1px #fff, inset -1px -1px #000, inset 2px 2px #dfdfdf, inset -2px -2px #808080;
+  --sunken: inset 1px 1px #808080, inset -1px -1px #fff, inset 2px 2px #000, inset -2px -2px #dfdfdf;
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100svh; display: flex; flex-direction: column; align-items: center; padding: 100px 24px 85px; }
+.desktop-label { position: absolute; top: 25px; left: 32px; display: grid; justify-items: center; gap: 4px; color: white; font-size: 12px; text-shadow: 1px 1px #004747; }
+.computer { font-size: 32px; color: #dedede; line-height: 1; }
+.window { width: min(740px, 100%); margin: auto 0; background: var(--gray); padding: 4px; box-shadow: var(--raised), 12px 12px 0 #005d5d; }
+.title-bar { background: #000080; color: white; padding: 5px 6px; display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: bold; gap: 12px; }
+.window-decoration { color: #000; background: var(--gray); box-shadow: var(--raised); padding: 1px 6px 3px; white-space: nowrap; letter-spacing: 5px; }
+.menu-strip { padding: 10px 14px; border-bottom: 1px solid #808080; box-shadow: 0 1px #fff; font-size: 12px; }
+.menu-strip span { margin: 0 12px; color: #666; }
+.content { padding: 32px 34px 26px; }
+.eyebrow { font: 11px "Courier New", monospace; letter-spacing: 2px; color: #424242; }
+h1 { margin: 15px 0; font-size: clamp(27px, 5vw, 43px); line-height: 1.12; letter-spacing: -1.7px; }
+.title-number { color: #000080; }
+.intro { max-width: 410px; font-size: 13px; line-height: 1.6; margin-bottom: 25px; }
+.joke-panel { background: #ffffe1; box-shadow: var(--sunken); padding: 21px 24px; }
+.joke-heading { display: flex; justify-content: space-between; font: 11px "Courier New", monospace; letter-spacing: 1px; color: #555; }
+#joke { min-height: 96px; margin: 22px 0 7px; font-size: 21px; line-height: 1.5; white-space: pre-line; overflow-wrap: anywhere; }
+.actions { display: flex; justify-content: space-between; align-items: center; gap: 18px; margin-top: 24px; }
+.hint { font-size: 11px; line-height: 1.7; color: #414141; }
+.buttons { display: flex; gap: 9px; }
+button, .start-button { font: inherit; font-size: 12px; color: #111; background: var(--gray); border: 0; border-radius: 0; box-shadow: var(--raised); padding: 11px 16px; cursor: pointer; }
+button.primary { outline: 1px solid #000; font-weight: bold; }
+button:active, .start-button:active { box-shadow: var(--sunken); }
+button:focus-visible, a:focus-visible { outline: 1px dotted #000; outline-offset: -5px; }
+button:disabled { color: #666; cursor: default; }
+.status-bar { display: flex; gap: 3px; font-size: 11px; }
+.status-bar span { padding: 6px 8px; box-shadow: inset 1px 1px #808080, inset -1px -1px #fff; }
+.status-bar span:first-child { flex: 1; }
+.desktop-footer { color: #c0e0df; font: 11px "Courier New", monospace; margin-top: 25px; }
+.taskbar { position: fixed; bottom: 0; left: 0; right: 0; background: var(--gray); box-shadow: inset 0 2px #fff; display: flex; gap: 9px; align-items: center; padding: 5px; font-size: 12px; }
+.start-button { text-decoration: none; font-weight: bold; padding: 8px 12px; }
+.start-button span { color: #000080; margin-right: 5px; }
+.task-button { width: 180px; padding: 8px 10px; background: #ddd; box-shadow: var(--sunken); font-weight: bold; }
+.tray { margin-left: auto; padding: 8px 12px; box-shadow: var(--sunken); font-size: 11px; }
+@media (max-width: 560px) {
+  body { padding: 95px 14px 75px; }
+  .content { padding: 25px 17px 20px; }
+  .actions { align-items: stretch; flex-direction: column; }
+  .buttons button { flex: 1; }
+  .joke-panel { padding: 20px; }
+  #joke { font-size: 18px; min-height: 130px; }
+  .status-bar span:last-child, .tray { display: none; }
+  .window { box-shadow: var(--raised), 6px 6px 0 #005d5d; }
+}
