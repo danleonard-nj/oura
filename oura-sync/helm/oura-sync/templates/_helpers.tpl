@@ -46,29 +46,3 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
-
-{{/*
-Name of the Secret holding the application credentials: an externally managed
-one when `existingSecret` is set, otherwise the one this chart renders.
-*/}}
-{{- define "oura-sync.secretName" -}}
-{{- if .Values.existingSecret }}
-{{- .Values.existingSecret }}
-{{- else }}
-{{- include "oura-sync.fullname" . }}
-{{- end }}
-{{- end }}
-
-{{/*
-True when at least one secret value is supplied inline, meaning the chart
-should render its own Secret.
-*/}}
-{{- define "oura-sync.createSecret" -}}
-{{- if .Values.existingSecret }}
-{{- "false" }}
-{{- else if or .Values.secrets.ouraClientId .Values.secrets.ouraClientSecret .Values.secrets.ouraRedirectUri .Values.secrets.tokenEncryptionKey .Values.secrets.mongodbUri .Values.secrets.redisUrl .Values.secrets.aadTenantId .Values.secrets.aadAudience .Values.secrets.aadRequiredRole }}
-{{- "true" }}
-{{- else }}
-{{- "false" }}
-{{- end }}
-{{- end }}

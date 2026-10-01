@@ -1,5 +1,7 @@
 oura-sync {{ .Chart.AppVersion }} is deployed as {{ include "oura-sync.fullname" . }}.
 
+{{- $scheme := ternary "https" "http" .Values.ingress.tls.enabled }}
+
 1. Check it came up:
 
      kubectl rollout status deployment/{{ include "oura-sync.fullname" . }} -n {{ .Release.Namespace }}
@@ -9,32 +11,61 @@ oura-sync {{ .Chart.AppVersion }} is deployed as {{ include "oura-sync.fullname"
    /ready reports Mongo and Redis. Both must be reachable before the pod
    joins the Service.
 
-2. This service has no ingress and no public endpoint by design -- it is
-   reached through the internal API gateway or from inside the cluster
-   (oura-mcp). Point your external cron scheduler's gateway route, and
-   oura-mcp's SYNC_SERVICE_BASE_URL, at it.
+{{- if not .Values.ingress.enabled }}
 
-3. Trigger a sync run by hand to confirm the wiring end to end:
+2. Ingress is disabled, so nothing is reachable from outside the cluster.
+   Enable it with --set ingress.enabled=true --set ingress.hostname=<host>,
+   and set the same host as service.public_host in config.json -- without it
+   the MCP transport's DNS-rebinding protection rejects every request that
+   does not arrive on localhost.
+{{- else }}
 
-     curl -sX POST http://localhost:8000/internal/sync/run \
-       -H "Authorization: Bearer $(your token minting command)" | jq
+2. Connect the Oura account, once:
 
-{{- if eq (include "oura-sync.createSecret" .) "true" }}
+     open {{ $scheme }}://{{ .Values.ingress.hostname }}/oauth/authorize
 
-NOTE: this release rendered its own Secret from inline values, so those
-credentials are stored in the Helm release history in plain text. For anything
-long-lived, create the Secret separately and set `existingSecret` instead.
-{{- else if not .Values.existingSecret }}
+   Or run the oura-auth bootstrap tool, which writes the same encrypted token
+   document straight into Mongo.
 
-WARNING: no `existingSecret` and no inline secret values. The pod has no
-credentials and will fail to start with a configuration error. Set
-`existingSecret` to a Secret containing OURA_CLIENT_ID, OURA_CLIENT_SECRET,
-OURA_REDIRECT_URI, TOKEN_ENCRYPTION_KEY, MONGODB_URI, REDIS_URL, AAD_TENANT_ID
-and AAD_AUDIENCE.
+   Confirm afterwards:
+
+     curl -s -H "Authorization: Bearer $MCP_API_KEY" \
+       {{ $scheme }}://{{ .Values.ingress.hostname }}/api/status | jq
+
+3. Point an MCP client at it:
+
+     claude mcp add --transport http oura {{ $scheme }}://{{ .Values.ingress.hostname }}/mcp \
+       --header "Authorization: Bearer $MCP_API_KEY"
+
+   Any Streamable HTTP MCP client works with the same URL and header.
+
+4. Register webhooks so cached data is invalidated as the ring syncs:
+
+     curl -X POST https://api.ouraring.com/v2/webhook/subscription \
+       -H "x-client-id: $OURA_CLIENT_ID" \
+       -H "x-client-secret: $OURA_CLIENT_SECRET" \
+       -H "Content-Type: application/json" \
+       -d '{"callback_url":"{{ $scheme }}://{{ .Values.ingress.hostname }}/webhooks/oura",
+            "verification_token":"'"$OURA_WEBHOOK_VERIFICATION_TOKEN"'",
+            "event_type":"update","data_type":"daily_sleep"}'
+
+   One subscription per event_type/data_type pair. The endpoint must already
+   be reachable: Oura verifies it before activating the subscription.
 {{- end }}
+
+Snapshot sync: point the external cron scheduler at POST /internal/sync/run
+on {{ include "oura-sync.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local. It needs an
+Azure AD token for one of auth.audiences in config.json; with no `auth`
+section, that route always answers 503.
+
+Settings come from the config.json baked into the image. A /ready that never
+goes green, or a pod that exits at startup naming a config key, means that
+file is incomplete -- rebuild the image with a corrected one.
 
 {{- if gt (int .Values.replicaCount) 1 }}
 
-Running {{ .Values.replicaCount }} replicas. The token refresh lock is a Redis
-lock shared with oura-mcp, so any replica of either service can safely refresh.
+Running {{ .Values.replicaCount }} replicas. Sticky sessions are not required:
+the MCP transport is stateless, and OAuth refresh is serialised across replicas
+by a Redis lock. Set mcp.request_state_secrets in config.json so MCP request
+state sealed by one replica opens on another.
 {{- end }}

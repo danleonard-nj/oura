@@ -2,9 +2,15 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+# Env files are never committed (left over from before config.json).
 .env
-# Production secrets, pushed to the cluster with push-secret.bat.
-.env.prod
+.env.*
+!.env.example
+# Configuration carries secrets and is never committed: CI/CD drops
+# config.json into the build. The committed template is config.example.json.
+config.json
+config.dev.json
+config.local.json
 *.egg-info/
 build/
 dist/

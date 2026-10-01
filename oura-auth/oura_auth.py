@@ -2,12 +2,12 @@
 """One-time Oura OAuth2 bootstrap.
 
 Runs the Authorization Code flow on your machine and writes the resulting token
-pair, encrypted, into the shared `oauth_tokens` collection. oura-mcp and
-oura-sync both read that document, so this only needs to be run once per
-account -- after that the services rotate the token themselves.
+pair, encrypted, into the shared `oauth_tokens` collection. oura-sync reads
+that document, so this only needs to be run once per account -- after that
+the service rotates the token itself.
 
 Standalone on purpose: it depends only on pymongo, cryptography and requests,
-so it can be run before either service is deployed, and from anywhere that can
+so it can be run before the service is deployed, and from anywhere that can
 reach the database.
 
     python oura_auth.py connect
@@ -99,7 +99,7 @@ def _require(name: str) -> str:
 class TokenStore:
     """Reads and writes the shared, encrypted `oauth_tokens` document.
 
-    Deliberately mirrors oura-mcp's TokenRepository: same collection, same
+    Deliberately mirrors oura-sync's TokenRepository: same collection, same
     field names, same Fernet encryption, same single-update rotation.
     """
 
@@ -331,7 +331,7 @@ def cmd_connect(settings: Settings, store: TokenStore) -> int:
         "\nStored encrypted in %s.%s for account '%s'.",
         settings.mongodb_database, COLLECTION, settings.account_id,
     )
-    logger.info("oura-mcp and oura-sync will pick it up and rotate it from here.")
+    logger.info("oura-sync will pick it up and rotate it from here.")
     return 0
 
 

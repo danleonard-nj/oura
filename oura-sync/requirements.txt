@@ -1,0 +1,12 @@
+# Private feed (py-packages); the Dockerfile adds it as an extra index.
+# The `mcp` extra brings in the MCP SDK that framework.mcp.MCPBlueprint serves.
+framework[mcp]==6.2.0
+
+hypercorn>=0.14
+httpx2>=2.5
+pymongo>=4.9
+redis>=5.0
+cryptography>=43
+pydantic>=2.9
+pydepi>=0.1.0
+pyjwt[crypto]>=2.9

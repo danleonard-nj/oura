@@ -18,59 +18,20 @@ serviceAccount:
   name: "oura-sync"
   annotations: {}
 
-# ClusterIP only, deliberately -- this service is reached through the
-# internal API gateway or from inside the cluster (oura-mcp), never directly
-# from outside it. No ingress/TLS templates in this chart.
 service:
   type: ClusterIP
   port: 80
   targetPort: 8000
 
 # ── Application configuration ─────────────────────────────────────────────
-# Non-secret values only. Everything sensitive comes from `secrets` below.
-config:
-  logLevel: INFO
-  mongodbDatabase: oura_mcp
-  ouraAccountId: default
-  # Space-separated -> the chart joins these with commas for SYNC_RESOURCES.
-  syncResources:
-    - ring_configuration
-    - ring_battery_level
-    - personal_info
-  # Extra plain environment variables, as name/value pairs.
-  extraEnv: []
-
-# ── Secrets ───────────────────────────────────────────────────────────────
-# Preferred: reference a Secret you already manage.
-#
-#   existingSecret: oura-shared   # shared with oura-mcp -- see ../../push-secret.bat
-#
-# The Secret must contain: OURA_CLIENT_ID, OURA_CLIENT_SECRET, OURA_REDIRECT_URI,
-# TOKEN_ENCRYPTION_KEY, MONGODB_URI, REDIS_URL, AAD_TENANT_ID, AAD_AUDIENCE
-# (and optionally AAD_REQUIRED_ROLE).
-#
-# Alternatively set the values under `secrets` and the chart renders a Secret.
-# Anything left empty is omitted, so it can come from `existingSecret` instead.
-# Values supplied this way land in your Helm release history in plain text --
-# prefer existingSecret for anything long-lived.
-existingSecret: ""
-
-secrets:
-  ouraClientId: ""
-  ouraClientSecret: ""
-  ouraRedirectUri: ""
-  tokenEncryptionKey: ""
-  # Mongo and Redis already exist in the cluster; this chart does not deploy
-  # them, and this is the same database oura-mcp uses.
-  mongodbUri: ""
-  redisUrl: ""
-  # This deployment's own Azure AD app registration -- what callers
-  # (the C# cron scheduler, oura-mcp) must present a token for.
-  aadTenantId: ""
-  aadAudience: ""
-  aadRequiredRole: ""
+# None here. Every application setting -- secrets included -- is in
+# config.json, which CI/CD drops into the image build (see the Dockerfile and
+# config.example.json). The chart only describes how the pod runs: no
+# ConfigMap, no Secret, nothing for the two to drift on.
 
 # ── Probes ────────────────────────────────────────────────────────────────
+# /health is dependency-free so a Mongo or Redis blip cannot cause a restart
+# loop. /ready checks Mongo and Redis and removes the pod from the Service.
 probes:
   liveness:
     path: /health
@@ -87,11 +48,11 @@ probes:
 
 resources:
   requests:
-    cpu: 50m
-    memory: 128Mi
+    cpu: 100m
+    memory: 192Mi
   limits:
-    cpu: 500m
-    memory: 256Mi
+    cpu: 1000m
+    memory: 512Mi
 
 # Matches the uid/gid baked into the image.
 podSecurityContext:
@@ -115,7 +76,40 @@ strategy:
     maxSurge: 1
     maxUnavailable: 0
 
+# Long enough for Hypercorn's --graceful-timeout of 25s to finish draining.
 terminationGracePeriodSeconds: 30
+
+# ── Ingress ───────────────────────────────────────────────────────────────
+ingress:
+  enabled: false
+  className: nginx
+  hostname: oura.example.com
+  path: /
+  pathType: Prefix
+  # Streamable HTTP holds a response open while a tool runs, so proxy read and
+  # send timeouts must be generous and response buffering must be off, or the
+  # proxy will cut the stream mid-call. The defaults below are ingress-nginx
+  # annotations; see the README for Traefik and HAProxy equivalents. Replace
+  # them wholesale if you run a different controller.
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "4m"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+  tls:
+    enabled: false
+    secretName: ""
+    # This cluster has no ClusterIssuers -- every namespace carries its own
+    # cert-manager Issuer, so the ingress is annotated `cert-manager.io/issuer`.
+    # A `cluster-issuer` annotation here would silently never issue a cert.
+    issuerName: letsencrypt-prod
+    # Create the Issuer as part of this release. Set false if the namespace
+    # already has one with this name.
+    createIssuer: true
+    email: ""
+    acmeServer: https://acme-v02.api.letsencrypt.org/directory
+    accountKeySecretName: letsencrypt-tls-prod
 
 autoscaling:
   enabled: false

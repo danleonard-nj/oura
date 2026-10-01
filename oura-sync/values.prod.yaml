@@ -1,13 +1,24 @@
-# Production overrides for the oura namespace.
-# Non-secret only: credentials come from the `oura-shared` Secret in-cluster,
-# shared with oura-mcp since both run in this same namespace -- see
-# ../push-secret.bat. deploy.bat supplies image.repository and image.tag.
+# Production overrides for the oura namespace: how the pod runs, nothing
+# about what it does. Application settings and secrets are in config.json,
+# baked into the image. deploy.bat supplies image.repository and image.tag.
 
 replicaCount: 1
 
-existingSecret: oura-shared
-
-config:
-  logLevel: INFO
-  mongodbDatabase: oura_mcp
-  ouraAccountId: default
+ingress:
+  enabled: true
+  hostname: oura.dan-leonard.com
+  className: nginx
+  tls:
+    enabled: true
+    # Namespaced Issuer, matching every other namespace in this cluster.
+    issuerName: letsencrypt-prod
+    createIssuer: true
+    email: dcl525@gmail.com
+  # Streamable HTTP holds a response open for the duration of a tool call, so
+  # the proxy must not buffer and must not time out early.
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "4m"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"

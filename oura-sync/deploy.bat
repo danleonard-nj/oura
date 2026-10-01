@@ -10,11 +10,26 @@ if defined COMMIT (
     echo Warning: Not a git repository, using timestamp only for tag
 )
 
+REM config.json carries the production settings and secrets, and is baked
+REM into the image. It is gitignored; CI/CD supplies it, and locally it is
+REM your own copy built from config.example.json.
+if not exist config.json (
+    echo config.json is missing. Create it from config.example.json -- see README.md, Configuration.
+    exit /b 1
+)
+
+REM `framework` installs from the private py-packages feed. The token is read
+REM from the environment and handed to the build as a BuildKit secret, so it
+REM is never written into the image or this file.
+if not defined ARTIFACT_FEED_TOKEN (
+    echo ARTIFACT_FEED_TOKEN is not set. Set it to a py-packages feed PAT and rerun.
+    exit /b 1
+)
+
 echo Building with tag: %TAG%
 
-REM Build context is the repo root (..), not this directory: the Dockerfile
-REM also copies the sibling oura-common/ shared source tree.
-docker build -t azureks.azurecr.io/oura/oura-sync:%TAG% -t azureks.azurecr.io/oura/oura-sync:latest -f Dockerfile ..
+set DOCKER_BUILDKIT=1
+docker build --secret id=artifact_feed_token,env=ARTIFACT_FEED_TOKEN -t azureks.azurecr.io/oura/oura-sync:%TAG% -t azureks.azurecr.io/oura/oura-sync:latest -f Dockerfile .
 if errorlevel 1 exit /b 1
 
 echo Pushing tagged image: %TAG%

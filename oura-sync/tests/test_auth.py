@@ -1,5 +1,7 @@
-"""require_gateway_token: the Starlette-response shape wrapped around
-oura_common.azure_ad.verify_bearer_token (unit-tested there in full)."""
+"""The route guards in app.utilities.auth, exercised on a minimal Quart app.
+
+`verify_bearer_token` itself is unit-tested in full in test_azure_ad.py; this
+covers the decorator shape around it and the MCP_API_KEY guard."""
 
 from __future__ import annotations
 
@@ -9,17 +11,47 @@ import jwt as pyjwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from quart import Quart
 
-import oura_sync.api.auth as auth_module
+from app.models.config import bind_sections
+from app.utilities.auth import require_api_key, require_gateway_token
+from app.utilities.provider import EXTENSION_KEY
 
 TENANT = "22222222-2222-2222-2222-222222222222"
 AUDIENCE = "api://oura-sync-app-id"
 ISSUER = f"https://login.microsoftonline.com/{TENANT}/v2.0"
 
 
-class FakeRequest:
-    def __init__(self, authorization: str | None) -> None:
-        self.headers = {"authorization": authorization} if authorization else {}
+class SectionsContainer:
+    """Resolves config sections only -- all the guards need."""
+
+    def __init__(self, config) -> None:
+        self._sections = bind_sections(config.values)
+
+    def resolve(self, service_type):
+        return self._sections[service_type]
+
+
+def guarded_app(config) -> Quart:
+    app = Quart(__name__)
+    app.extensions[EXTENSION_KEY] = SectionsContainer(config)
+
+    @app.route("/gateway")
+    @require_gateway_token
+    async def gateway():
+        return {"ok": True}
+
+    @app.route("/admin")
+    @require_api_key
+    async def admin():
+        return {"ok": True}
+
+    return app
+
+
+async def get(app: Quart, path: str, authorization: str | None):
+    headers = {"Authorization": authorization} if authorization else {}
+    return await app.test_client().get(path, headers=headers)
 
 
 @pytest.fixture(scope="module")
@@ -49,7 +81,7 @@ def fake_jwks(monkeypatch, keypair):
         def get_signing_key_from_jwt(self, _token: str) -> FakeSigningKey:
             return FakeSigningKey(public_pem)
 
-    import oura_common.azure_ad as azure_ad
+    import app.utilities.azure_ad as azure_ad
 
     monkeypatch.setattr(azure_ad, "_jwks_clients", {TENANT: FakeJwksClient()})
 
@@ -61,34 +93,40 @@ def make_token(keypair) -> str:
     return pyjwt.encode(claims, private_pem, algorithm="RS256")
 
 
-def resolve_config(monkeypatch, config):
-    monkeypatch.setattr(auth_module, "resolve", lambda _request, _type: config)
+async def test_an_unconfigured_deployment_always_refuses(config):
+    # No `auth` section at all
+    response = await get(guarded_app(config), "/gateway", "Bearer whatever")
 
-
-def test_an_unconfigured_deployment_always_refuses(monkeypatch, config):
-    resolve_config(monkeypatch, config)  # aad_tenant_id/aad_audience are None by default
-
-    response = auth_module.require_gateway_token(FakeRequest("Bearer whatever"))
-
-    assert response is not None
     assert response.status_code == 503
+    assert (await response.get_json())["error"] == "not_configured"
 
 
-def test_a_valid_token_is_accepted(monkeypatch, config, keypair):
-    config = config.model_copy(update={"aad_tenant_id": TENANT, "aad_audience": AUDIENCE})
-    resolve_config(monkeypatch, config)
-    token = make_token(keypair)
+async def test_a_valid_token_is_accepted(config, keypair):
+    config = config.replace("auth", tenant_id=TENANT, audiences=[AUDIENCE])
 
-    response = auth_module.require_gateway_token(FakeRequest(f"Bearer {token}"))
+    response = await get(guarded_app(config), "/gateway", f"Bearer {make_token(keypair)}")
 
-    assert response is None
+    assert response.status_code == 200
+    assert await response.get_json() == {"ok": True}
 
 
-def test_a_missing_token_is_refused(monkeypatch, config):
-    config = config.model_copy(update={"aad_tenant_id": TENANT, "aad_audience": AUDIENCE})
-    resolve_config(monkeypatch, config)
+async def test_a_missing_token_is_refused(config):
+    config = config.replace("auth", tenant_id=TENANT, audiences=[AUDIENCE])
 
-    response = auth_module.require_gateway_token(FakeRequest(None))
+    response = await get(guarded_app(config), "/gateway", None)
 
-    assert response is not None
     assert response.status_code == 401
+
+
+async def test_the_api_key_is_accepted_on_admin_routes(config):
+    response = await get(guarded_app(config), "/admin", "Bearer test-mcp-api-key")
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize("authorization", [None, "Bearer wrong", "Basic test-mcp-api-key"])
+async def test_admin_routes_refuse_anything_but_the_api_key(config, authorization):
+    response = await get(guarded_app(config), "/admin", authorization)
+
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"].startswith("Bearer")

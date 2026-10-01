@@ -15,14 +15,10 @@ spec:
       {{- include "oura-sync.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      {{- with .Values.podAnnotations }}
       annotations:
-        # Restart the pods when the non-secret configuration changes. A change
-        # to the Secret is deliberately not tracked here: it would put secret
-        # material into the pod template.
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-        {{- end }}
+      {{- end }}
       labels:
         {{- include "oura-sync.selectorLabels" . | nindent 8 }}
         {{- with .Values.podLabels }}
@@ -47,18 +43,12 @@ spec:
             - name: http
               containerPort: {{ .Values.service.targetPort }}
               protocol: TCP
-          envFrom:
-            - configMapRef:
-                name: {{ include "oura-sync.fullname" . }}
-            - secretRef:
-                name: {{ include "oura-sync.secretName" . }}
+          # Application settings come from config.json, baked into the image
+          # (see the Dockerfile) -- no ConfigMap or Secret. PORT is only
+          # hypercorn's bind port.
           env:
             - name: PORT
               value: {{ .Values.service.targetPort | quote }}
-            {{- range .Values.config.extraEnv }}
-            - name: {{ .name }}
-              value: {{ .value | quote }}
-            {{- end }}
           livenessProbe:
             httpGet:
               path: {{ .Values.probes.liveness.path }}

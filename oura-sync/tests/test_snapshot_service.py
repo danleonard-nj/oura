@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from oura_common.models.resources import Resource
+from app.models.resources import Resource
 
-from oura_sync.repositories.snapshot_repository import SnapshotRepository
-from oura_sync.services.snapshot_service import SnapshotService
+from app.repositories.snapshot_repository import SnapshotRepository
+from app.services.snapshot_service import SnapshotService
 
 
 class Fetch:
@@ -15,7 +15,7 @@ class Fetch:
 
 
 class FakeOuraService:
-    """Stands in for oura_common's OuraService -- only what SnapshotService calls."""
+    """Stands in for OuraService -- only what SnapshotService calls."""
 
     account_id = "default"
 
