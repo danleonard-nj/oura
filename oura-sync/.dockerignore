@@ -1,0 +1,30 @@
+# Build context is oura-sync/ (see deploy.bat); only requirements.txt, app/
+# and config.json are copied into the image. config.json must NOT be listed
+# here -- it is the production configuration the image runs with.
+
+**/.git
+**/.venv
+**/venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.benchmarks
+
+tests
+helm
+htmlcov
+.coverage
+
+**/.env
+**/.env.*
+config.dev.json
+config.local.json
+config.example.json
+
+README.md
+Dockerfile
+.dockerignore
+deploy.bat
+values.prod.yaml

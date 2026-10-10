@@ -2,11 +2,12 @@
 
 One-time Oura OAuth2 bootstrap. Runs the Authorization Code flow on your
 machine and writes the resulting token pair, encrypted, into the shared
-`oauth_tokens` collection that `oura-mcp` and `oura-sync` both read.
+`oauth_tokens` collection that `oura-sync` reads.
 
-It lives outside `oura-mcp` because it is not part of that service: both
-services consume the token, neither should own the interactive flow, and this
-needs to run before either is deployed.
+It lives outside `oura-sync` because it is not part of that service: the
+service consumes the token, it should not own an interactive flow that runs
+on your machine, and this needs to run before it is deployed. (`oura-sync`'s
+own `/oauth/authorize` does the same job once it is reachable.)
 
 ## Setup
 
@@ -14,18 +15,26 @@ needs to run before either is deployed.
 cd oura-auth
 python -m venv .venv && .venv/Scripts/activate     # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
+cp ../.env.example ../.env
 ```
 
-Fill in `.env`. Three values matter most:
+**The `.env` lives at the repo root**, shared with oura-sync -- see its
+README for why. This script reads whatever `--env-file` you
+pass it (default `./.env`), so point it at the shared one explicitly:
+
+```bash
+python oura_auth.py connect --env-file ../.env
+```
+
+Fill in the root `.env`. Three values matter most:
 
 - `OURA_CLIENT_ID` / `OURA_CLIENT_SECRET` — from
   <https://cloud.ouraring.com/oauth/applications>.
 - `OURA_REDIRECT_URI` — must match a redirect URI registered on that
   application **exactly**. For the local bootstrap use a loopback URL such as
   `http://localhost:8000/oauth/callback`; the script serves it itself.
-- `TOKEN_ENCRYPTION_KEY` — must be **byte-identical** to the key `oura-mcp`
-  and `oura-sync` run with, or they cannot decrypt what this writes.
+- `TOKEN_ENCRYPTION_KEY` — must be **byte-identical** to the key `oura-sync`
+  runs with, or it cannot decrypt what this writes.
 
 Generate the encryption key once and reuse it everywhere:
 
@@ -36,7 +45,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ## Usage
 
 ```bash
-python oura_auth.py connect
+python oura_auth.py connect --env-file ../.env
 ```
 
 Opens your browser to Oura's consent screen, captures the redirect on
@@ -88,7 +97,7 @@ Two rules any writer must follow:
 2. **Take the Redis lock before refreshing.** Oura refresh tokens are
    single-use. Two processes refreshing from the same stored token means one
    result is discarded and the account can lose its refresh token entirely.
-   `oura-mcp`'s `TokenService` does this; anything else that refreshes must
+   `oura-sync`'s `TokenService` does this; anything else that refreshes must
    use the same lock key, `oura:lock:refresh:{account_id}`.
 
 ## Security
@@ -98,4 +107,4 @@ Two rules any writer must follow:
 - No command prints an access token, refresh token or authorization code.
 - Token-endpoint failures report only Oura's error code, never the submitted
   grant.
-- `.env` is gitignored. Keep it that way.
+- The shared root `.env` is gitignored. Keep it that way.

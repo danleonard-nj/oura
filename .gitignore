@@ -1,4 +1,7 @@
-oura-mcp/.env.example
-oura-mcp/.dockerignore
-oura-mcp/.env.example
-oura-mcp/values.prod.yaml
+# Env files for the oura-auth bootstrap tool (see .env.example). oura-sync
+# itself reads config.json, ignored in oura-sync/.gitignore.
+/.env
+/.env.prod
+/.env.prod.bak-scopes
+/.env.bak-scopes
+oura-sync/config.example.json

@@ -1,0 +1,1277 @@
+"""End-to-end tests over the real ASGI application.
+
+The app is built by `create_app`, so these exercise the actual composition:
+the Quart app and its blueprints, the MCP Streamable HTTP transport served by
+framework's MCPBlueprint behind its bearer auth, the correlation middleware,
+and the session manager the blueprint runs while Quart is serving. Starlette's
+TestClient drives it as a plain ASGI app, lifespan included. Only the
+outermost infrastructure -- Mongo, Redis and the Oura client -- is swapped for
+fakes.
+"""
+
+from __future__ import annotations
+
+import base64
+import contextlib
+import hashlib
+import hmac
+import json
+import secrets
+from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlparse
+
+import pytest
+from starlette.testclient import TestClient
+
+from app.clients.oura_client import OuraApiClient, WebhookSubscriptionClient
+from app.models.resources import Resource
+from app.repositories.audit_repository import AuditRepository
+from app.repositories.request_log_repository import RequestLogRepository
+from app.repositories.token_repository import TokenRepository
+from app.repositories.webhook_repository import WebhookRepository
+from tests.conftest import (
+    FakeAuditRepository,
+    FakeDatabase,
+    FakeRedis,
+    FakeRequestLogRepository,
+    FakeTokenRepository,
+    FakeWebhookRepository,
+    make_token,
+)
+
+HOST = "oura.test"
+API_KEY = "test-mcp-api-key"
+
+SLEEP_RECORDS = [
+    {"day": "2026-09-01", "score": 82, "id": "s1"},
+    {"day": "2026-09-02", "score": 74, "id": "s2"},
+]
+
+
+class StubOuraClient:
+    """Stands in for the blocking client; records what was asked for."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+        self.error: Exception | None = None
+
+    async def fetch_range(self, token, resource, start, end):
+        self.calls.append((resource, start, end))
+        if self.error:
+            raise self.error
+        if resource is Resource.WORKOUT:
+            return [{"day": "2026-09-01", "activity": "cycling"}]
+        return SLEEP_RECORDS
+
+    async def fetch_personal_info(self, token):
+        self.calls.append(("personal_info",))
+        if self.error:
+            raise self.error
+        return {"age": 41, "biological_sex": "male", "weight": 78.0}
+
+
+class StubSubscriptions:
+    """Stands in for Oura's webhook subscription routes."""
+
+    def __init__(self) -> None:
+        self.created: list[dict] = []
+        self.renewed: list[str] = []
+        self.deleted: list[str] = []
+
+    async def list_subscriptions(self):
+        return [
+            {
+                "id": "sub-1",
+                "data_type": "daily_sleep",
+                "expiration_time": "2026-12-01T00:00:00+00:00",
+            }
+        ]
+
+    async def create_subscription(self, **kwargs):
+        self.created.append(kwargs)
+        return {"id": "sub-2", **kwargs}
+
+    async def renew_subscription(self, subscription_id):
+        self.renewed.append(subscription_id)
+        return {"id": subscription_id, "expiration_time": "2027-01-01T00:00:00+00:00"}
+
+    async def delete_subscription(self, subscription_id):
+        self.deleted.append(subscription_id)
+        return None
+
+
+@pytest.fixture
+def stub_client() -> StubOuraClient:
+    return StubOuraClient()
+
+
+class FakeMongoClient:
+    """Only `admin.command("ping")` is used, by the readiness probe."""
+
+    def __init__(self, *, available: bool = True) -> None:
+        self.available = available
+        self.admin = self
+
+    async def command(self, _name: str):
+        if not self.available:
+            raise RuntimeError("mongo is down")
+        return {"ok": 1}
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.fixture
+def fakes(stub_client):
+    return {
+        "mongo": FakeMongoClient(),
+        "redis": FakeRedis(),
+        "tokens": FakeTokenRepository(make_token()),
+        "audit": FakeAuditRepository(),
+        "requests": FakeRequestLogRepository(),
+        "webhooks": FakeWebhookRepository(),
+        "oura": stub_client,
+        "subscriptions": StubSubscriptions(),
+        "database": FakeDatabase(),
+    }
+
+
+@contextlib.contextmanager
+def running_app(config, fakes, monkeypatch, tmp_path):
+    """A TestClient over the real app, with infrastructure swapped at the container.
+
+    Overriding registrations rather than patching module globals keeps the
+    composition honest: if a service stops taking its dependency through the
+    constructor, this stops working.
+    """
+    from pymongo import AsyncMongoClient
+    from pymongo.asynchronous.database import AsyncDatabase
+    from redis.asyncio import Redis
+
+    import app.app as app_module
+    from app.utilities.provider import build_services, create_provider
+
+    def create_provider_with_fakes():
+        services = build_services()
+        services.add_singleton(AsyncMongoClient, factory=lambda _: fakes["mongo"])
+        services.add_singleton(AsyncDatabase, factory=lambda _: fakes["database"])
+        services.add_singleton(Redis, factory=lambda _: fakes["redis"])
+        services.add_singleton(TokenRepository, factory=lambda _: fakes["tokens"])
+        services.add_singleton(AuditRepository, factory=lambda _: fakes["audit"])
+        services.add_singleton(RequestLogRepository, factory=lambda _: fakes["requests"])
+        services.add_singleton(WebhookRepository, factory=lambda _: fakes["webhooks"])
+        services.add_singleton(OuraApiClient, factory=lambda _: fakes["oura"])
+        services.add_singleton(
+            WebhookSubscriptionClient, factory=lambda _: fakes["subscriptions"]
+        )
+        return create_provider(services)
+
+    monkeypatch.setattr(app_module, "create_provider", create_provider_with_fakes)
+    monkeypatch.setattr(app_module, "ensure_indexes", _noop)
+
+    # A real config.json read through framework's Configuration, the same way
+    # the deployed app gets its settings.
+    (tmp_path / "config.json").write_text(json.dumps(config.values), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("QUART_ENV", raising=False)
+    monkeypatch.delenv("FLASK_ENV", raising=False)
+
+    with TestClient(app_module.create_app()) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def client(config, fakes, monkeypatch, tmp_path):
+    with running_app(config, fakes, monkeypatch, tmp_path) as test_client:
+        yield test_client
+
+
+async def _noop(*_args, **_kwargs) -> None:
+    return None
+
+
+def rpc(client: TestClient, method: str, params: dict | None = None, request_id: int = 1):
+    """Send one JSON-RPC call and unwrap the SSE frame the transport returns."""
+    response = client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}},
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "Host": HOST,
+        },
+    )
+    assert response.status_code == 200, response.text
+    for line in response.text.splitlines():
+        if line.startswith("data: "):
+            return json.loads(line[6:])
+    raise AssertionError(f"no data frame in response: {response.text!r}")
+
+
+def initialize(client: TestClient) -> None:
+    rpc(
+        client,
+        "initialize",
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "tests", "version": "1"},
+        },
+    )
+
+
+def call_tool(client: TestClient, name: str, arguments: dict | None = None) -> dict:
+    initialize(client)
+    return rpc(client, "tools/call", {"name": name, "arguments": arguments or {}}, request_id=2)
+
+
+# ── Health ────────────────────────────────────────────────────────────────
+
+
+def test_health_is_ok_and_needs_no_dependencies(client):
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_health_stays_ok_when_redis_is_down(client, fakes):
+    fakes["redis"].available = False
+
+    assert client.get("/health").status_code == 200
+
+
+def test_health_requires_no_authentication(client):
+    assert client.get("/health").status_code == 200
+    assert client.get("/ready").status_code in (200, 503)
+
+
+def test_readiness_reports_dependency_state(client):
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["checks"] == {
+        "mongo": True,
+        "redis": True,
+    }
+
+
+def test_readiness_fails_when_redis_is_unavailable(client, fakes):
+    fakes["redis"].available = False
+
+    response = client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["redis"] is False
+
+
+def test_every_response_carries_a_correlation_id(client):
+    response = client.get("/health")
+
+    assert response.headers["x-correlation-id"]
+
+
+def test_an_inbound_correlation_id_is_echoed(client):
+    response = client.get("/health", headers={"x-correlation-id": "caller-supplied"})
+
+    assert response.headers["x-correlation-id"] == "caller-supplied"
+
+
+def test_a_request_is_logged_with_its_correlation_id(client, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="oura.access"):
+        response = client.get("/api/status", headers=AUTH)
+
+    record = next(r for r in caplog.records if r.name == "oura.access")
+    assert record.path == "/api/status"
+    assert record.status == 200
+    assert record.correlation_id == response.headers["x-correlation-id"]
+    assert record.duration_ms >= 0
+    assert record.bytes > 0
+
+
+def test_probe_requests_are_logged_at_debug_not_info(client, caplog):
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="oura.access"):
+        client.get("/health")
+
+    record = next(r for r in caplog.records if r.name == "oura.access")
+    assert record.levelno == logging.DEBUG
+
+
+def test_access_log_prefers_x_real_ip_over_the_socket_peer(client, caplog):
+    """Behind ingress-nginx, scope["client"] is the ingress pod, not the caller."""
+    import logging
+
+    headers = {**AUTH, "x-real-ip": "203.0.113.7"}
+    with caplog.at_level(logging.INFO, logger="oura.access"):
+        client.get("/api/status", headers=headers)
+
+    record = next(r for r in caplog.records if r.name == "oura.access")
+    assert record.client_ip == "203.0.113.7"
+
+
+def test_access_log_falls_back_to_the_last_x_forwarded_for_hop(client, caplog):
+    """The rightmost hop is the one nginx itself appended; anything to its
+    left was supplied by the client and is not trustworthy."""
+    import logging
+
+    headers = {**AUTH, "x-forwarded-for": "1.2.3.4, 203.0.113.7"}
+    with caplog.at_level(logging.INFO, logger="oura.access"):
+        client.get("/api/status", headers=headers)
+
+    record = next(r for r in caplog.records if r.name == "oura.access")
+    assert record.client_ip == "203.0.113.7"
+
+
+def test_access_log_falls_back_to_the_socket_peer_without_proxy_headers(client, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="oura.access"):
+        client.get("/api/status", headers=AUTH)
+
+    record = next(r for r in caplog.records if r.name == "oura.access")
+    assert record.client_ip == "testclient"
+
+
+# ── Request log persistence ──────────────────────────────────────────────
+
+
+def test_a_request_is_persisted_to_the_request_log(client, fakes):
+    response = client.get("/api/status", headers=AUTH)
+
+    entry = fakes["requests"].entries[-1]
+    assert entry.path == "/api/status"
+    assert entry.method == "GET"
+    assert entry.status == 200
+    assert entry.correlation_id == response.headers["x-correlation-id"]
+    assert entry.client_ip == "testclient"
+
+
+def test_probe_requests_are_not_persisted(client, fakes):
+    client.get("/health")
+
+    assert fakes["requests"].entries == []
+
+
+def test_a_mongo_request_log_failure_does_not_fail_the_request(client, fakes):
+    fakes["requests"].failing = True
+
+    response = client.get("/api/status", headers=AUTH)
+
+    assert response.status_code == 200
+
+
+def test_api_requests_lists_recently_logged_requests(client, fakes):
+    client.get("/api/status", headers=AUTH)
+
+    response = client.get("/api/requests", headers=AUTH)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] >= 1
+    assert any(r["path"] == "/api/status" for r in body["requests"])
+
+
+def test_api_requests_requires_the_admin_key(client):
+    response = client.get("/api/requests")
+
+    assert response.status_code == 401
+
+
+# ── MCP authentication ────────────────────────────────────────────────────
+
+
+def test_mcp_rejects_a_request_with_no_token(client):
+    response = client.post("/mcp", json={}, headers={"Host": HOST})
+
+    assert response.status_code == 401
+    assert "Bearer" in response.headers["www-authenticate"]
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["Bearer wrong-key", "Basic dGVzdDp0ZXN0", "test-mcp-api-key", "Bearer ", ""],
+)
+def test_mcp_rejects_malformed_or_wrong_credentials(client, header):
+    response = client.post("/mcp", json={}, headers={"Authorization": header, "Host": HOST})
+
+    assert response.status_code == 401
+
+
+def test_mcp_accepts_the_configured_key(client):
+    initialize(client)  # asserts a 200 internally
+
+
+def test_mcp_endpoint_is_reachable_without_a_trailing_slash_redirect(client):
+    """The blueprint serves the exact rule; a redirect to `/mcp/` would strand clients."""
+    response = client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Accept": "application/json, text/event-stream",
+            "Host": HOST,
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code != 307, "the MCP endpoint redirected; clients will not follow"
+
+
+def test_transport_security_rejects_an_unexpected_host(client):
+    """DNS-rebinding protection must be live, not left on the localhost default."""
+    response = client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Accept": "application/json, text/event-stream",
+            "Host": "attacker.example.com",
+        },
+    )
+
+    assert response.status_code == 421
+
+
+# ── MCP tools ─────────────────────────────────────────────────────────────
+
+
+def test_the_expected_tools_are_advertised(client):
+    initialize(client)
+    tools = {t["name"] for t in rpc(client, "tools/list", request_id=2)["result"]["tools"]}
+
+    assert {
+        "oura_summary", "oura_sleep", "oura_readiness", "oura_activity", "oura_stress",
+        "oura_heart_rate", "oura_workouts", "oura_sessions", "oura_spo2", "oura_resilience",
+        "oura_cardiovascular_age", "oura_vo2_max", "oura_tags", "oura_ring_info",
+        "oura_personal_info", "oura_query", "oura_clear_cache",
+    } <= tools
+
+
+def test_every_tool_has_a_description_and_typed_parameters(client):
+    initialize(client)
+    tools = rpc(client, "tools/list", request_id=2)["result"]["tools"]
+
+    for tool in tools:
+        assert len(tool.get("description", "")) > 60, f"{tool['name']} is under-described"
+        schema = tool["inputSchema"]
+        assert schema["type"] == "object"
+        for name, prop in schema.get("properties", {}).items():
+            assert "type" in prop or "anyOf" in prop, f"{tool['name']}.{name} is untyped"
+
+
+def test_a_tool_call_returns_structured_content(client, fakes):
+    result = call_tool(client, "oura_sleep", {"start_date": "2026-09-01", "end_date": "2026-09-02"})
+
+    structured = result["result"]["structuredContent"]
+    assert structured["resource"] == "daily_sleep"
+    assert structured["count"] == 2
+    assert structured["records"] == SLEEP_RECORDS
+    assert structured["cache"] == "miss"
+    assert fakes["oura"].calls == [(Resource.DAILY_SLEEP, "2026-09-01", "2026-09-02")]
+
+
+def test_a_tool_call_with_no_dates_uses_a_sensible_default(client, fakes):
+    call_tool(client, "oura_sleep")
+
+    resource, start, end = fakes["oura"].calls[0]
+    assert resource is Resource.DAILY_SLEEP
+    # Defaults are computed in UTC so a container's local timezone cannot change
+    # which day a tool call resolves to.
+    assert end == datetime.now(UTC).date().isoformat()
+    assert start < end
+
+
+def test_personal_info_returns_a_single_document(client):
+    result = call_tool(client, "oura_personal_info")
+
+    assert result["result"]["structuredContent"]["document"]["age"] == 41
+
+
+def test_summary_joins_resources_by_day(client):
+    result = call_tool(
+        client, "oura_summary", {"start_date": "2026-09-01", "end_date": "2026-09-02"}
+    )
+
+    summary = result["result"]["structuredContent"]
+    days = {d["day"]: d for d in summary["days"]}
+    assert set(days) == {"2026-09-01", "2026-09-02"}
+    assert days["2026-09-01"]["sleep"]["score"] == 82
+    assert days["2026-09-01"]["workouts"][0]["activity"] == "cycling"
+
+
+def test_summary_with_unavailable_resilience_is_audited_as_partial(client, fakes, monkeypatch):
+    from app.models.errors import OuraPermissionError
+
+    original = fakes["oura"].fetch_range
+
+    def fetch(token, resource, start, end):
+        if resource is Resource.DAILY_RESILIENCE:
+            raise OuraPermissionError("Resilience unavailable")
+        return original(token, resource, start, end)
+
+    monkeypatch.setattr(fakes["oura"], "fetch_range", fetch)
+    result = call_tool(client, "oura_summary", {
+        "start_date": "2026-09-01", "end_date": "2026-09-02",
+    })
+
+    summary = result["result"]["structuredContent"]
+    assert summary["days"]
+    assert len(summary["unavailable"]) == 1
+    invocation = next(e for e in fakes["audit"].events if e.action.value == "tool_invoked")
+    assert invocation.status == "partial"
+
+
+def test_an_invalid_date_is_reported_as_a_tool_error(client):
+    result = call_tool(client, "oura_sleep", {"start_date": "not-a-date"})
+
+    assert result["result"]["isError"] is True
+    assert "ISO-8601" in json.dumps(result["result"]["content"])
+
+
+def test_an_oversized_range_is_refused(client, fakes):
+    result = call_tool(
+        client, "oura_heart_rate", {"start_date": "2026-01-01", "end_date": "2026-06-01"}
+    )
+
+    assert result["result"]["isError"] is True
+    assert "14-day maximum" in json.dumps(result["result"]["content"])
+    assert fakes["oura"].calls == [], "an over-large range still reached Oura"
+
+
+def test_an_upstream_403_becomes_a_readable_tool_error(client, fakes):
+    from tests.conftest import http_error
+
+    fakes["oura"].error = http_error(403)
+
+    result = call_tool(client, "oura_sleep", {"start_date": "2026-09-01"})
+
+    content = json.dumps(result["result"]["content"])
+    assert result["result"]["isError"] is True
+    assert "scope" in content
+    assert "access-0" not in content, "a token leaked into a tool error"
+
+
+def test_oura_query_rejects_an_unknown_resource(client):
+    result = call_tool(client, "oura_query", {"resource": "made_up"})
+
+    assert result["result"]["isError"] is True
+    assert "Unknown resource" in json.dumps(result["result"]["content"])
+
+
+def test_oura_query_reaches_a_collection_without_a_named_tool(client, fakes):
+    call_tool(client, "oura_query", {"resource": "sleep_time", "start_date": "2026-09-01"})
+
+    assert fakes["oura"].calls[0][0] is Resource.SLEEP_TIME
+
+
+def test_clear_cache_makes_the_next_call_read_live(client, fakes):
+    args = {"start_date": "2026-09-01", "end_date": "2026-09-02"}
+    call_tool(client, "oura_sleep", args)
+    assert call_tool(client, "oura_sleep", args)["result"]["structuredContent"]["cache"] == "hit"
+
+    cleared = call_tool(client, "oura_clear_cache")["result"]["structuredContent"]
+    assert set(cleared["cleared"]) == {r.value for r in Resource}
+    assert cleared["failed"] == []
+
+    assert call_tool(client, "oura_sleep", args)["result"]["structuredContent"]["cache"] == "miss"
+    assert len(fakes["oura"].calls) == 2
+
+
+def test_clear_cache_can_target_named_resources(client, fakes):
+    args = {"start_date": "2026-09-01", "end_date": "2026-09-02"}
+    call_tool(client, "oura_sleep", args)
+    call_tool(client, "oura_readiness", args)
+
+    cleared = call_tool(client, "oura_clear_cache", {"resources": ["daily_sleep"]})
+    assert cleared["result"]["structuredContent"]["cleared"] == ["daily_sleep"]
+
+    assert call_tool(client, "oura_sleep", args)["result"]["structuredContent"]["cache"] == "miss"
+    assert call_tool(client, "oura_readiness", args)["result"]["structuredContent"]["cache"] == "hit"
+
+
+def test_clear_cache_rejects_an_unknown_resource(client):
+    result = call_tool(client, "oura_clear_cache", {"resources": ["made_up"]})
+
+    assert result["result"]["isError"] is True
+    assert "made_up" in result["result"]["content"][0]["text"]
+
+
+def test_clear_cache_reports_failures_when_redis_is_down(client, fakes):
+    fakes["redis"].available = False
+
+    cleared = call_tool(client, "oura_clear_cache", {"resources": ["daily_sleep"]})
+
+    assert cleared["result"]["structuredContent"] == {"cleared": [], "failed": ["daily_sleep"]}
+
+
+def test_a_tool_call_is_audited(client, fakes):
+    call_tool(client, "oura_sleep", {"start_date": "2026-09-01", "end_date": "2026-09-02"})
+
+    actions = [e.action.value for e in fakes["audit"].events]
+    assert "tool_invoked" in actions
+    invocation = next(e for e in fakes["audit"].events if e.action.value == "tool_invoked")
+    assert invocation.tool == "oura_sleep"
+    assert invocation.resource == "daily_sleep"
+    assert invocation.start_date == "2026-09-01"
+    assert invocation.duration_ms is not None
+    assert invocation.correlation_id
+
+
+def test_a_mongo_audit_failure_does_not_fail_the_tool(client, fakes):
+    fakes["audit"].failing = True
+
+    result = call_tool(client, "oura_sleep", {"start_date": "2026-09-01"})
+
+    assert "isError" not in result["result"] or result["result"]["isError"] is False
+    assert result["result"]["structuredContent"]["count"] == 2
+
+
+def test_no_audit_record_contains_token_material(client, fakes):
+    call_tool(client, "oura_sleep", {"start_date": "2026-09-01"})
+
+    dumped = json.dumps([e.model_dump(mode="json") for e in fakes["audit"].events])
+    assert "access-0" not in dumped
+    assert "refresh-0" not in dumped
+
+
+# ── OAuth ─────────────────────────────────────────────────────────────────
+
+
+def test_authorize_redirects_to_oura(client):
+    response = client.get("/oauth/authorize", follow_redirects=False)
+
+    assert response.status_code == 302
+    location = response.headers["location"]
+    assert location.startswith("https://cloud.ouraring.com/oauth/authorize")
+    assert "state=" in location
+    assert "client_secret" not in location
+
+
+def test_callback_rejects_an_unknown_state(client):
+    response = client.get("/oauth/callback?code=abc&state=never-issued")
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_state"
+
+
+def test_callback_without_a_code_is_refused(client):
+    response = client.get("/oauth/callback?state=x")
+
+    assert response.status_code == 400
+
+
+def test_a_denied_authorization_is_reported(client):
+    response = client.get("/oauth/callback?error=access_denied&state=x")
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "oauth_denied"
+
+
+# ── Webhooks ──────────────────────────────────────────────────────────────
+
+
+def test_webhook_challenge_is_echoed(client):
+    response = client.get(
+        "/webhooks/oura",
+        params={"verification_token": "test-verification-token", "challenge": "nonce-9"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"challenge": "nonce-9"}
+
+
+def test_webhook_challenge_with_a_wrong_token_is_refused(client):
+    response = client.get(
+        "/webhooks/oura", params={"verification_token": "nope", "challenge": "nonce-9"}
+    )
+
+    assert response.status_code == 401
+
+
+def test_a_correctly_signed_event_is_accepted(client, config, fakes):
+    body = json.dumps(
+        {"event_type": "update", "data_type": "daily_sleep", "object_id": "o1"},
+        separators=(",", ":"),
+    ).encode()
+    timestamp = "1767225600"
+    signature = hmac.new(
+        config.oura.client_secret.get_secret_value().encode(),
+        timestamp.encode() + body,
+        hashlib.sha256,
+    ).hexdigest().upper()
+
+    response = client.post(
+        "/webhooks/oura",
+        content=body,
+        headers={
+            "x-oura-signature": signature,
+            "x-oura-timestamp": timestamp,
+            "Content-Type": "application/json",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "accepted"
+    assert len(fakes["webhooks"].records) == 1
+
+
+def test_an_unsigned_event_is_rejected(client):
+    response = client.post("/webhooks/oura", json={"event_type": "update"})
+
+    assert response.status_code == 401
+    assert response.json()["error"] == "invalid_signature"
+
+
+def test_a_forged_signature_is_rejected(client, fakes):
+    response = client.post(
+        "/webhooks/oura",
+        content=b'{"event_type":"update","data_type":"sleep","object_id":"x"}',
+        headers={"x-oura-signature": "DEADBEEF", "x-oura-timestamp": "1767225600"},
+    )
+
+    assert response.status_code == 401
+    assert fakes["webhooks"].records == []
+
+
+# ── Admin API ─────────────────────────────────────────────────────────────
+
+
+def test_admin_status_requires_the_api_key(client):
+    assert client.get("/api/status").status_code == 401
+
+
+def test_admin_status_never_returns_token_material(client):
+    response = client.get("/api/status", headers={"Authorization": f"Bearer {API_KEY}"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["connected"] is True
+    assert "daily" in body["scopes"]
+    serialised = json.dumps(body)
+    assert "access-0" not in serialised
+    assert "refresh-0" not in serialised
+    assert "access_token" not in serialised
+
+
+def test_admin_status_reports_a_disconnected_account(client, fakes):
+    fakes["tokens"].token = None
+
+    response = client.get("/api/status", headers={"Authorization": f"Bearer {API_KEY}"})
+
+    assert response.json()["connected"] is False
+
+
+def test_admin_audit_requires_the_api_key(client):
+    assert client.get("/api/audit").status_code == 401
+    assert client.get("/api/audit", headers={"Authorization": f"Bearer {API_KEY}"}).status_code == 200
+
+
+# ── Webhook subscription management ───────────────────────────────────────
+
+
+@pytest.fixture
+def subscription_client(fakes):
+    """The stub registered in place of the Oura subscription client."""
+    return fakes["subscriptions"]
+
+
+AUTH = {"Authorization": f"Bearer {API_KEY}"}
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/webhooks/subscriptions"),
+        ("POST", "/api/webhooks/subscriptions"),
+        ("PUT", "/api/webhooks/subscriptions/sub-1/renew"),
+        ("DELETE", "/api/webhooks/subscriptions/sub-1"),
+    ],
+)
+def test_subscription_routes_require_the_api_key(client, method, path):
+    assert client.request(method, path).status_code == 401
+
+
+def test_subscriptions_can_be_listed(client, subscription_client):
+    response = client.get("/api/webhooks/subscriptions", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["subscriptions"][0]["expiration_time"]
+
+
+def test_a_subscription_can_be_created(client, subscription_client, config):
+    response = client.post(
+        "/api/webhooks/subscriptions", headers=AUTH, json={"data_type": "daily_sleep"}
+    )
+
+    assert response.status_code == 200
+    created = subscription_client.created[0]
+    # callback_url defaults to the configured public host.
+    assert created["callback_url"] == f"https://{config.service.public_host}/webhooks/oura"
+    assert created["event_type"] == "update"
+    assert created["verification_token"] == "test-verification-token"
+
+
+def test_creating_a_subscription_requires_a_data_type(client, subscription_client):
+    response = client.post("/api/webhooks/subscriptions", headers=AUTH, json={})
+
+    assert response.status_code == 400
+    assert subscription_client.created == []
+
+
+def test_a_subscription_can_be_renewed(client, subscription_client):
+    response = client.put("/api/webhooks/subscriptions/sub-1/renew", headers=AUTH)
+
+    assert response.status_code == 200
+    assert subscription_client.renewed == ["sub-1"]
+
+
+def test_a_subscription_can_be_deleted(client, subscription_client):
+    response = client.delete("/api/webhooks/subscriptions/sub-1", headers=AUTH)
+
+    assert response.status_code == 200
+    assert subscription_client.deleted == ["sub-1"]
+
+
+def test_an_upstream_subscription_failure_leaks_nothing(client, subscription_client, config):
+    from tests.conftest import http_error
+
+    def boom(**_kwargs):
+        raise http_error(403)
+
+    subscription_client.create_subscription = boom
+
+    response = client.post(
+        "/api/webhooks/subscriptions", headers=AUTH, json={"data_type": "sleep"}
+    )
+
+    assert response.status_code == 502
+    body = json.dumps(response.json())
+    assert config.oura.client_secret.get_secret_value() not in body
+    assert "test-verification-token" not in body
+
+
+# ── Snapshot sync and resource history ───────────────────────────────────
+
+
+@pytest.fixture
+def gateway_client(config, fakes, monkeypatch, tmp_path):
+    """Gateway auth configured, and any bearer token accepted; azure_ad is covered elsewhere."""
+    import app.utilities.auth as auth_module
+
+    monkeypatch.setattr(auth_module, "verify_bearer_token", lambda *_args, **_kwargs: {})
+    gateway_config = config.replace("auth", tenant_id="tenant", audiences=["api://oura-sync"])
+    with running_app(gateway_config, fakes, monkeypatch, tmp_path) as test_client:
+        yield test_client
+
+
+GATEWAY_AUTH = {"Authorization": "Bearer gateway-token"}
+
+
+def test_sync_run_refuses_without_gateway_auth_configured(client):
+    response = client.post("/internal/sync/run", headers=AUTH)
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "not_configured"
+
+
+def test_sync_run_archives_samples_that_resource_history_returns(gateway_client, fakes):
+    response = gateway_client.post(
+        "/internal/sync/run", headers=GATEWAY_AUTH, json={"resources": ["ring_battery_level"]}
+    )
+
+    assert response.status_code == 200
+    (result,) = response.json()["results"]
+    assert {k: result[k] for k in ("resource", "fetched", "inserted", "updated")} == {
+        "resource": "ring_battery_level", "fetched": 2, "inserted": 2, "updated": 0
+    }
+
+    result = call_tool(gateway_client, "oura_resource_history", {"resource": "ring_battery_level"})
+
+    structured = result["result"]["structuredContent"]
+    assert structured["resource"] == "ring_battery_level"
+    assert structured["count"] == 2
+    assert [r["payload"] for r in structured["records"]] == SLEEP_RECORDS
+
+
+def test_an_unchanged_resource_is_not_stored_twice(gateway_client, fakes):
+    body = {"resources": ["ring_battery_level"]}
+    gateway_client.post("/internal/sync/run", headers=GATEWAY_AUTH, json=body)
+
+    response = gateway_client.post("/internal/sync/run", headers=GATEWAY_AUTH, json=body)
+
+    (result,) = response.json()["results"]
+    assert (result["fetched"], result["inserted"], result["updated"]) == (2, 0, 0)
+    assert len(fakes["database"]["oura_records"].documents) == 2
+
+
+def test_sync_run_rejects_an_unknown_resource(gateway_client):
+    response = gateway_client.post(
+        "/internal/sync/run", headers=GATEWAY_AUTH, json={"resources": ["made_up"]}
+    )
+
+    assert response.status_code == 400
+
+
+def test_resource_history_until_covers_the_whole_day(client, fakes):
+    samples = fakes["database"]["oura_records"]
+    for day, hour, level in ((1, 9, 80), (1, 23, 40), (2, 1, 95)):
+        samples.documents.append(
+            {
+                "account_id": "default",
+                "resource": "ring_battery_level",
+                "record_key": f"2026-09-0{day}T{hour:02d}",
+                "payload": {"level": level},
+                "observed_at": datetime(2026, 9, day, hour, tzinfo=UTC),
+            }
+        )
+
+    result = call_tool(
+        client,
+        "oura_resource_history",
+        {"resource": "ring_battery_level", "since": "2026-09-01", "until": "2026-09-01"},
+    )
+
+    records = result["result"]["structuredContent"]["records"]
+    assert [r["payload"]["level"] for r in records] == [80, 40]
+
+
+def test_resource_history_reads_any_archived_resource(client, fakes):
+    fakes["database"]["oura_records"].documents.append(
+        {
+            "account_id": "default",
+            "resource": "daily_sleep",
+            "record_key": "s1",
+            "payload": {"id": "s1", "day": "2019-03-01", "score": 81},
+            "observed_at": datetime(2019, 3, 1, tzinfo=UTC),
+        }
+    )
+
+    result = call_tool(client, "oura_resource_history", {"resource": "daily_sleep"})
+
+    records = result["result"]["structuredContent"]["records"]
+    assert [r["payload"]["score"] for r in records] == [81]
+
+
+def test_resource_history_refuses_a_resource_this_deployment_does_not_sync(
+    config, fakes, monkeypatch, tmp_path
+):
+    narrowed = config.replace("sync", resources=["ring_battery_level"])
+    with running_app(narrowed, fakes, monkeypatch, tmp_path) as test_client:
+        result = call_tool(test_client, "oura_resource_history", {"resource": "daily_sleep"})
+
+    assert result["result"]["isError"] is True
+    assert "not synced by this deployment" in json.dumps(result["result"]["content"])
+
+
+def test_resource_history_refuses_an_unknown_resource(client):
+    result = call_tool(client, "oura_resource_history", {"resource": "made_up"})
+
+    assert result["result"]["isError"] is True
+    assert "Unknown resource" in json.dumps(result["result"]["content"])
+
+
+def test_history_route_serves_the_archive(gateway_client, fakes):
+    fakes["database"]["oura_records"].documents.append(
+        {
+            "account_id": "default",
+            "resource": "workout",
+            "record_key": "w1",
+            "payload": {"id": "w1", "activity": "cycling"},
+            "observed_at": datetime(2020, 6, 1, tzinfo=UTC),
+        }
+    )
+
+    response = gateway_client.get("/api/history/workout?since=2020-01-01", headers=GATEWAY_AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 1
+    assert response.json()["records"][0]["payload"]["activity"] == "cycling"
+
+
+def test_history_route_reports_a_bad_bound(gateway_client):
+    response = gateway_client.get("/api/history/workout?since=yesterday", headers=GATEWAY_AUTH)
+
+    assert response.status_code == 400
+
+
+def test_backfill_can_be_started_and_reports_progress(gateway_client, fakes):
+    response = gateway_client.post(
+        "/internal/sync/backfill",
+        headers=GATEWAY_AUTH,
+        json={"resources": ["workout"], "restart": True},
+    )
+    assert response.status_code == 202
+    assert response.json()["started"] is True
+
+    status = gateway_client.get("/internal/sync/backfill", headers=GATEWAY_AUTH).json()
+    assert {r["resource"] for r in status["resources"]} == {
+        r.value for r in Resource if r not in (Resource.PERSONAL_INFO, Resource.RING_CONFIGURATION)
+    }
+
+
+def test_backfill_refuses_a_current_state_resource(gateway_client):
+    response = gateway_client.post(
+        "/internal/sync/backfill", headers=GATEWAY_AUTH, json={"resources": ["personal_info"]}
+    )
+
+    assert response.status_code == 400
+
+
+def test_resource_history_reports_a_bad_date_as_a_tool_error(client):
+    result = call_tool(
+        client, "oura_resource_history", {"resource": "personal_info", "since": "yesterday"}
+    )
+
+    assert result["result"]["isError"] is True
+    assert "ISO-8601" in json.dumps(result["result"]["content"])
+
+
+# ── MCP OAuth over HTTP ───────────────────────────────────────────────────
+
+OWNER_PASSWORD = "owner-secret-for-tests"
+CLIENT_REDIRECT = "https://client.example/callback"
+
+
+@pytest.fixture
+def oauth_client(config, fakes, monkeypatch, tmp_path):
+    oauth_config = config.replace("mcp", oauth={"owner_password": OWNER_PASSWORD})
+    with running_app(oauth_config, fakes, monkeypatch, tmp_path) as test_client:
+        yield test_client
+
+
+def test_oauth_metadata_is_published(oauth_client):
+    server = oauth_client.get("/.well-known/oauth-authorization-server").json()
+    resource = oauth_client.get("/.well-known/oauth-protected-resource/mcp").json()
+
+    assert server["issuer"] == "https://oura.test/"
+    assert server["authorization_endpoint"] == "https://oura.test/authorize"
+    assert server["token_endpoint"] == "https://oura.test/token"
+    assert server["registration_endpoint"] == "https://oura.test/register"
+    assert resource["resource"] == "https://oura.test/mcp"
+    assert resource["authorization_servers"] == ["https://oura.test/"]
+
+
+def test_the_mcp_challenge_points_at_the_resource_metadata(oauth_client):
+    response = oauth_client.post("/mcp", json={}, headers={"Host": HOST})
+
+    assert response.status_code == 401
+    assert (
+        'resource_metadata="https://oura.test/.well-known/oauth-protected-resource/mcp"'
+        in response.headers["www-authenticate"]
+    )
+
+
+def test_the_api_key_still_works_with_oauth_enabled(oauth_client):
+    initialize(oauth_client)
+
+
+def test_an_oauth_client_can_authorize_and_call_mcp(oauth_client):
+    registration = oauth_client.post(
+        "/register",
+        json={
+            "redirect_uris": [CLIENT_REDIRECT],
+            "client_name": "tests",
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+        },
+    )
+    assert registration.status_code == 201, registration.text
+    client_id = registration.json()["client_id"]
+
+    verifier = secrets.token_urlsafe(48)
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    )
+    authorize = oauth_client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": CLIENT_REDIRECT,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "state-123",
+            "scope": "oura:read",
+        },
+        follow_redirects=False,
+    )
+    assert authorize.status_code == 302, authorize.text
+    consent_url = urlparse(authorize.headers["location"])
+    assert consent_url.path == "/consent"
+    txn = parse_qs(consent_url.query)["txn"][0]
+
+    assert oauth_client.get("/consent", params={"txn": txn}).status_code == 200
+
+    approved = oauth_client.post(
+        "/consent",
+        data={"txn": txn, "password": OWNER_PASSWORD, "action": "approve"},
+        follow_redirects=False,
+    )
+    assert approved.status_code == 302, approved.text
+    callback = urlparse(approved.headers["location"])
+    assert f"{callback.scheme}://{callback.netloc}{callback.path}" == CLIENT_REDIRECT
+    query = parse_qs(callback.query)
+    assert query["state"] == ["state-123"]
+
+    token = oauth_client.post(
+        "/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": query["code"][0],
+            "redirect_uri": CLIENT_REDIRECT,
+            "client_id": client_id,
+            "code_verifier": verifier,
+        },
+    )
+    assert token.status_code == 200, token.text
+    access_token = token.json()["access_token"]
+
+    response = oauth_client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json, text/event-stream",
+            "Host": HOST,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_a_wrong_owner_password_does_not_issue_a_code(oauth_client):
+    registration = oauth_client.post(
+        "/register",
+        json={
+            "redirect_uris": [CLIENT_REDIRECT],
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+        },
+    )
+    authorize = oauth_client.get(
+        "/authorize",
+        params={
+            "response_type": "code",
+            "client_id": registration.json()["client_id"],
+            "redirect_uri": CLIENT_REDIRECT,
+            "code_challenge": "x" * 43,
+            "code_challenge_method": "S256",
+            "state": "s",
+        },
+        follow_redirects=False,
+    )
+    txn = parse_qs(urlparse(authorize.headers["location"]).query)["txn"][0]
+
+    response = oauth_client.post(
+        "/consent", data={"txn": txn, "password": "wrong", "action": "approve"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 401
+    assert "location" not in response.headers
+
+
+def test_the_scheduler_runs_a_sync_when_the_app_starts(config, fakes, monkeypatch, tmp_path):
+    import time
+
+    scheduled = config.replace("sync", interval_hours=6, resources=["ring_battery_level"])
+    with running_app(scheduled, fakes, monkeypatch, tmp_path):
+        deadline = time.monotonic() + 5
+        while not fakes["database"]["oura_records"].documents and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+    assert len(fakes["database"]["oura_records"].documents) == 2
+    assert any(k.startswith("oura:sync:schedule:default:") for k in fakes["redis"].store)
+
+
+# ── Ring wear ─────────────────────────────────────────────────────────────
+
+
+def _wearing_for_the_last_hour(stub_client: StubOuraClient) -> None:
+    """Make the stub Oura report an hour of worn activity slots ending now."""
+    from datetime import timedelta
+
+    started = datetime.now(UTC) - timedelta(hours=1)
+
+    async def fetch_range(token, resource, start, end):
+        stub_client.calls.append((resource, start, end))
+        if resource is Resource.DAILY_ACTIVITY:
+            return [{"id": "a1", "day": started.date().isoformat(), "timestamp": started.isoformat(),
+                     "class_5_min": "1" * 12, "non_wear_time": 0}]
+        return []
+
+    stub_client.fetch_range = fetch_range
+
+
+def test_the_wear_tools_are_advertised(client):
+    initialize(client)
+    tools = {t["name"] for t in rpc(client, "tools/list", request_id=2)["result"]["tools"]}
+
+    assert {"oura_wear_status", "oura_wear_intervals"} <= tools
+
+
+def test_wear_status_is_unknown_before_the_first_poll(client):
+    result = call_tool(client, "oura_wear_status")
+
+    structured = result["result"]["structuredContent"]
+    assert structured["status"] == "UNKNOWN"
+    assert structured["fresh"] is False
+
+
+def test_a_wear_poll_is_reported_by_the_route_and_the_tool(gateway_client, fakes):
+    _wearing_for_the_last_hour(fakes["oura"])
+
+    response = gateway_client.post("/internal/wear/poll", headers=GATEWAY_AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "WORN"
+    assert gateway_client.get("/api/wear/status", headers=GATEWAY_AUTH).json()["status"] == "WORN"
+    structured = call_tool(gateway_client, "oura_wear_status")["result"]["structuredContent"]
+    assert structured["status"] == "WORN"
+    assert structured["source"] == ["daily_activity"]
+
+    intervals = call_tool(gateway_client, "oura_wear_intervals")["result"]["structuredContent"]
+    assert [i["status"] for i in intervals["intervals"]] == ["WORN"]
+    assert [t["status"] for t in intervals["transitions"]] == ["WORN"]
+
+
+def test_wear_history_reports_a_bad_bound(gateway_client):
+    response = gateway_client.get("/api/wear/history?since=yesterday", headers=GATEWAY_AUTH)
+
+    assert response.status_code == 400
+
+
+def test_wear_backfill_reads_the_archive(gateway_client, fakes):
+    response = gateway_client.post("/internal/wear/backfill", headers=GATEWAY_AUTH, json={"since": "2026-01-01"})
+
+    assert response.status_code == 200
+    assert response.json() == {"days": 0, "updated": 0}
+    assert fakes["oura"].calls == []
+
+
+def test_wear_routes_refuse_without_gateway_auth_configured(client):
+    assert client.get("/api/wear/status", headers=AUTH).status_code == 503
+    assert client.post("/internal/wear/poll", headers=AUTH).status_code == 503
+
+
+def test_the_wear_poller_runs_when_the_app_starts(config, fakes, monkeypatch, tmp_path):
+    import time
+
+    _wearing_for_the_last_hour(fakes["oura"])
+    scheduled = config.replace("wear", poll_interval_minutes=15)
+    with running_app(scheduled, fakes, monkeypatch, tmp_path):
+        deadline = time.monotonic() + 5
+        while not fakes["database"]["wear_status"].documents and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+    (status,) = fakes["database"]["wear_status"].documents
+    assert status["status"] == "WORN"
+    assert any(k.startswith("oura:wear:schedule:default:") for k in fakes["redis"].store)

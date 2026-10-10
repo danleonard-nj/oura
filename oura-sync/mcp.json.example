@@ -1,0 +1,30 @@
+{
+  "$comment": [
+    "Example MCP client configuration for the deployed oura-sync MCP endpoint.",
+    "Replace oura.example.com with your ingress hostname and paste your",
+    "MCP_API_KEY into the Authorization header. Do not commit a filled-in copy.",
+    "",
+    "The API key is not issued by Oura or anyone else -- you generate it:",
+    "  python -c \"import secrets; print(secrets.token_urlsafe(48))\"",
+    "The same value must be the MCP_API_KEY key of the server's Kubernetes",
+    "Secret and the bearer token below.",
+    "",
+    "Claude Code, from the repo root:",
+    "  claude mcp add --transport http oura https://oura.example.com/mcp \\",
+    "    --header \"Authorization: Bearer $MCP_API_KEY\"",
+    "",
+    "Claude Desktop / Claude web: add it as a Custom Connector using the same",
+    "URL and header. ChatGPT connects with OAuth instead of the header when",
+    "MCP_OWNER_PASSWORD is set on the server -- see README.md, MCP OAuth.",
+    "Any Streamable HTTP MCP client works; the transport and auth are standard."
+  ],
+  "mcpServers": {
+    "oura": {
+      "type": "http",
+      "url": "https://oura.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_YOUR_MCP_API_KEY"
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+apiVersion: v2
+name: oura-sync
+description: Oura Ring service -- snapshot sync, admin API and an MCP server over Streamable HTTP
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - mcp
+  - oura
+  - health
+  - sync
+maintainers:
+  - name: Dan Leonard
+    email: dcl525@gmail.com

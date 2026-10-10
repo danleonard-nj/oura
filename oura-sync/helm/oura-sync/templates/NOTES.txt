@@ -1,0 +1,71 @@
+oura-sync {{ .Chart.AppVersion }} is deployed as {{ include "oura-sync.fullname" . }}.
+
+{{- $scheme := ternary "https" "http" .Values.ingress.tls.enabled }}
+
+1. Check it came up:
+
+     kubectl rollout status deployment/{{ include "oura-sync.fullname" . }} -n {{ .Release.Namespace }}
+     kubectl port-forward svc/{{ include "oura-sync.fullname" . }} 8000:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+     curl -s localhost:8000/ready | jq
+
+   /ready reports Mongo and Redis. Both must be reachable before the pod
+   joins the Service.
+
+{{- if not .Values.ingress.enabled }}
+
+2. Ingress is disabled, so nothing is reachable from outside the cluster.
+   Enable it with --set ingress.enabled=true --set ingress.hostname=<host>,
+   and set the same host as service.public_host in config.json -- without it
+   the MCP transport's DNS-rebinding protection rejects every request that
+   does not arrive on localhost.
+{{- else }}
+
+2. Connect the Oura account, once:
+
+     open {{ $scheme }}://{{ .Values.ingress.hostname }}/oauth/authorize
+
+   Or run the oura-auth bootstrap tool, which writes the same encrypted token
+   document straight into Mongo.
+
+   Confirm afterwards:
+
+     curl -s -H "Authorization: Bearer $MCP_API_KEY" \
+       {{ $scheme }}://{{ .Values.ingress.hostname }}/api/status | jq
+
+3. Point an MCP client at it:
+
+     claude mcp add --transport http oura {{ $scheme }}://{{ .Values.ingress.hostname }}/mcp \
+       --header "Authorization: Bearer $MCP_API_KEY"
+
+   Any Streamable HTTP MCP client works with the same URL and header.
+
+4. Register webhooks so cached data is invalidated as the ring syncs:
+
+     curl -X POST https://api.ouraring.com/v2/webhook/subscription \
+       -H "x-client-id: $OURA_CLIENT_ID" \
+       -H "x-client-secret: $OURA_CLIENT_SECRET" \
+       -H "Content-Type: application/json" \
+       -d '{"callback_url":"{{ $scheme }}://{{ .Values.ingress.hostname }}/webhooks/oura",
+            "verification_token":"'"$OURA_WEBHOOK_VERIFICATION_TOKEN"'",
+            "event_type":"update","data_type":"daily_sleep"}'
+
+   One subscription per event_type/data_type pair. The endpoint must already
+   be reachable: Oura verifies it before activating the subscription.
+{{- end }}
+
+Snapshot sync: point the external cron scheduler at POST /internal/sync/run
+on {{ include "oura-sync.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local. It needs an
+Azure AD token for one of auth.audiences in config.json; with no `auth`
+section, that route always answers 503.
+
+Settings come from the config.json baked into the image. A /ready that never
+goes green, or a pod that exits at startup naming a config key, means that
+file is incomplete -- rebuild the image with a corrected one.
+
+{{- if gt (int .Values.replicaCount) 1 }}
+
+Running {{ .Values.replicaCount }} replicas. Sticky sessions are not required:
+the MCP transport is stateless, and OAuth refresh is serialised across replicas
+by a Redis lock. Set mcp.request_state_secrets in config.json so MCP request
+state sealed by one replica opens on another.
+{{- end }}

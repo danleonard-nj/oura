@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# Env files are never committed (left over from before config.json).
+.env
+.env.*
+!.env.example
+# Configuration carries secrets and is never committed: CI/CD drops
+# config.json into the build. The committed template is config.example.json.
+config.json
+config.dev.json
+config.local.json
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
