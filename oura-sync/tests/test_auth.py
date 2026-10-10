@@ -13,36 +13,23 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from quart import Quart
 
-from app.models.config import bind_sections
 from app.utilities.auth import require_api_key, require_gateway_token
-from app.utilities.provider import EXTENSION_KEY
 
 TENANT = "22222222-2222-2222-2222-222222222222"
 AUDIENCE = "api://oura-sync-app-id"
 ISSUER = f"https://login.microsoftonline.com/{TENANT}/v2.0"
 
 
-class SectionsContainer:
-    """Resolves config sections only -- all the guards need."""
-
-    def __init__(self, config) -> None:
-        self._sections = bind_sections(config.values)
-
-    def resolve(self, service_type):
-        return self._sections[service_type]
-
-
 def guarded_app(config) -> Quart:
     app = Quart(__name__)
-    app.extensions[EXTENSION_KEY] = SectionsContainer(config)
 
     @app.route("/gateway")
-    @require_gateway_token
+    @require_gateway_token(config.auth)
     async def gateway():
         return {"ok": True}
 
     @app.route("/admin")
-    @require_api_key
+    @require_api_key(config.mcp)
     async def admin():
         return {"ok": True}
 

@@ -149,10 +149,10 @@ def running_app(config, fakes, monkeypatch, tmp_path):
     from redis.asyncio import Redis
 
     import app.app as app_module
-    from app.utilities.provider import build_services
+    from app.utilities.provider import build_services, create_provider
 
-    def build_provider_with_fakes(configuration):
-        services = build_services(configuration)
+    def create_provider_with_fakes():
+        services = build_services()
         services.add_singleton(AsyncMongoClient, factory=lambda _: fakes["mongo"])
         services.add_singleton(AsyncDatabase, factory=lambda _: fakes["database"])
         services.add_singleton(Redis, factory=lambda _: fakes["redis"])
@@ -164,9 +164,9 @@ def running_app(config, fakes, monkeypatch, tmp_path):
         services.add_singleton(
             WebhookSubscriptionClient, factory=lambda _: fakes["subscriptions"]
         )
-        return services.build_provider(eager_all=False)
+        return create_provider(services)
 
-    monkeypatch.setattr(app_module, "build_provider", build_provider_with_fakes)
+    monkeypatch.setattr(app_module, "create_provider", create_provider_with_fakes)
     monkeypatch.setattr(app_module, "ensure_indexes", _noop)
 
     # A real config.json read through framework's Configuration, the same way
@@ -254,7 +254,6 @@ def test_readiness_reports_dependency_state(client):
     body = response.json()
     assert body["status"] == "ready"
     assert body["checks"] == {
-        "application": True,
         "mongo": True,
         "redis": True,
     }
@@ -451,7 +450,7 @@ def test_the_expected_tools_are_advertised(client):
         "oura_summary", "oura_sleep", "oura_readiness", "oura_activity", "oura_stress",
         "oura_heart_rate", "oura_workouts", "oura_sessions", "oura_spo2", "oura_resilience",
         "oura_cardiovascular_age", "oura_vo2_max", "oura_tags", "oura_ring_info",
-        "oura_personal_info", "oura_query",
+        "oura_personal_info", "oura_query", "oura_clear_cache",
     } <= tools
 
 
@@ -570,6 +569,46 @@ def test_oura_query_reaches_a_collection_without_a_named_tool(client, fakes):
     call_tool(client, "oura_query", {"resource": "sleep_time", "start_date": "2026-09-01"})
 
     assert fakes["oura"].calls[0][0] is Resource.SLEEP_TIME
+
+
+def test_clear_cache_makes_the_next_call_read_live(client, fakes):
+    args = {"start_date": "2026-09-01", "end_date": "2026-09-02"}
+    call_tool(client, "oura_sleep", args)
+    assert call_tool(client, "oura_sleep", args)["result"]["structuredContent"]["cache"] == "hit"
+
+    cleared = call_tool(client, "oura_clear_cache")["result"]["structuredContent"]
+    assert set(cleared["cleared"]) == {r.value for r in Resource}
+    assert cleared["failed"] == []
+
+    assert call_tool(client, "oura_sleep", args)["result"]["structuredContent"]["cache"] == "miss"
+    assert len(fakes["oura"].calls) == 2
+
+
+def test_clear_cache_can_target_named_resources(client, fakes):
+    args = {"start_date": "2026-09-01", "end_date": "2026-09-02"}
+    call_tool(client, "oura_sleep", args)
+    call_tool(client, "oura_readiness", args)
+
+    cleared = call_tool(client, "oura_clear_cache", {"resources": ["daily_sleep"]})
+    assert cleared["result"]["structuredContent"]["cleared"] == ["daily_sleep"]
+
+    assert call_tool(client, "oura_sleep", args)["result"]["structuredContent"]["cache"] == "miss"
+    assert call_tool(client, "oura_readiness", args)["result"]["structuredContent"]["cache"] == "hit"
+
+
+def test_clear_cache_rejects_an_unknown_resource(client):
+    result = call_tool(client, "oura_clear_cache", {"resources": ["made_up"]})
+
+    assert result["result"]["isError"] is True
+    assert "made_up" in result["result"]["content"][0]["text"]
+
+
+def test_clear_cache_reports_failures_when_redis_is_down(client, fakes):
+    fakes["redis"].available = False
+
+    cleared = call_tool(client, "oura_clear_cache", {"resources": ["daily_sleep"]})
+
+    assert cleared["result"]["structuredContent"] == {"cleared": [], "failed": ["daily_sleep"]}
 
 
 def test_a_tool_call_is_audited(client, fakes):
@@ -842,29 +881,34 @@ def test_sync_run_refuses_without_gateway_auth_configured(client):
     assert response.json()["error"] == "not_configured"
 
 
-def test_sync_run_stores_a_snapshot_that_resource_history_returns(gateway_client, fakes):
+def test_sync_run_archives_samples_that_resource_history_returns(gateway_client, fakes):
     response = gateway_client.post(
         "/internal/sync/run", headers=GATEWAY_AUTH, json={"resources": ["ring_battery_level"]}
     )
 
     assert response.status_code == 200
-    assert response.json()["results"] == [{"resource": "ring_battery_level", "changed": True}]
+    (result,) = response.json()["results"]
+    assert {k: result[k] for k in ("resource", "fetched", "inserted", "updated")} == {
+        "resource": "ring_battery_level", "fetched": 2, "inserted": 2, "updated": 0
+    }
 
     result = call_tool(gateway_client, "oura_resource_history", {"resource": "ring_battery_level"})
 
     structured = result["result"]["structuredContent"]
     assert structured["resource"] == "ring_battery_level"
-    assert structured["count"] == 1
-    assert structured["records"][0]["payload"] == SLEEP_RECORDS[-1]
+    assert structured["count"] == 2
+    assert [r["payload"] for r in structured["records"]] == SLEEP_RECORDS
 
 
-def test_an_unchanged_resource_is_not_stored_twice(gateway_client):
+def test_an_unchanged_resource_is_not_stored_twice(gateway_client, fakes):
     body = {"resources": ["ring_battery_level"]}
     gateway_client.post("/internal/sync/run", headers=GATEWAY_AUTH, json=body)
 
     response = gateway_client.post("/internal/sync/run", headers=GATEWAY_AUTH, json=body)
 
-    assert response.json()["results"] == [{"resource": "ring_battery_level", "changed": False}]
+    (result,) = response.json()["results"]
+    assert (result["fetched"], result["inserted"], result["updated"]) == (2, 0, 0)
+    assert len(fakes["database"]["oura_records"].documents) == 2
 
 
 def test_sync_run_rejects_an_unknown_resource(gateway_client):
@@ -876,24 +920,17 @@ def test_sync_run_rejects_an_unknown_resource(gateway_client):
 
 
 def test_resource_history_until_covers_the_whole_day(client, fakes):
-    snapshots = fakes["database"]["resource_snapshots"]
-    for hour, level in ((9, 80), (23, 40)):
-        snapshots.documents.append(
+    samples = fakes["database"]["oura_records"]
+    for day, hour, level in ((1, 9, 80), (1, 23, 40), (2, 1, 95)):
+        samples.documents.append(
             {
                 "account_id": "default",
                 "resource": "ring_battery_level",
+                "record_key": f"2026-09-0{day}T{hour:02d}",
                 "payload": {"level": level},
-                "first_seen_at": datetime(2026, 9, 1, hour, tzinfo=UTC),
+                "observed_at": datetime(2026, 9, day, hour, tzinfo=UTC),
             }
         )
-    snapshots.documents.append(
-        {
-            "account_id": "default",
-            "resource": "ring_battery_level",
-            "payload": {"level": 95},
-            "first_seen_at": datetime(2026, 9, 2, 1, tzinfo=UTC),
-        }
-    )
 
     result = call_tool(
         client,
@@ -905,11 +942,86 @@ def test_resource_history_until_covers_the_whole_day(client, fakes):
     assert [r["payload"]["level"] for r in records] == [80, 40]
 
 
-def test_resource_history_refuses_an_untracked_resource(client):
+def test_resource_history_reads_any_archived_resource(client, fakes):
+    fakes["database"]["oura_records"].documents.append(
+        {
+            "account_id": "default",
+            "resource": "daily_sleep",
+            "record_key": "s1",
+            "payload": {"id": "s1", "day": "2019-03-01", "score": 81},
+            "observed_at": datetime(2019, 3, 1, tzinfo=UTC),
+        }
+    )
+
     result = call_tool(client, "oura_resource_history", {"resource": "daily_sleep"})
 
+    records = result["result"]["structuredContent"]["records"]
+    assert [r["payload"]["score"] for r in records] == [81]
+
+
+def test_resource_history_refuses_a_resource_this_deployment_does_not_sync(
+    config, fakes, monkeypatch, tmp_path
+):
+    narrowed = config.replace("sync", resources=["ring_battery_level"])
+    with running_app(narrowed, fakes, monkeypatch, tmp_path) as test_client:
+        result = call_tool(test_client, "oura_resource_history", {"resource": "daily_sleep"})
+
     assert result["result"]["isError"] is True
-    assert "no tracked history" in json.dumps(result["result"]["content"])
+    assert "not synced by this deployment" in json.dumps(result["result"]["content"])
+
+
+def test_resource_history_refuses_an_unknown_resource(client):
+    result = call_tool(client, "oura_resource_history", {"resource": "made_up"})
+
+    assert result["result"]["isError"] is True
+    assert "Unknown resource" in json.dumps(result["result"]["content"])
+
+
+def test_history_route_serves_the_archive(gateway_client, fakes):
+    fakes["database"]["oura_records"].documents.append(
+        {
+            "account_id": "default",
+            "resource": "workout",
+            "record_key": "w1",
+            "payload": {"id": "w1", "activity": "cycling"},
+            "observed_at": datetime(2020, 6, 1, tzinfo=UTC),
+        }
+    )
+
+    response = gateway_client.get("/api/history/workout?since=2020-01-01", headers=GATEWAY_AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 1
+    assert response.json()["records"][0]["payload"]["activity"] == "cycling"
+
+
+def test_history_route_reports_a_bad_bound(gateway_client):
+    response = gateway_client.get("/api/history/workout?since=yesterday", headers=GATEWAY_AUTH)
+
+    assert response.status_code == 400
+
+
+def test_backfill_can_be_started_and_reports_progress(gateway_client, fakes):
+    response = gateway_client.post(
+        "/internal/sync/backfill",
+        headers=GATEWAY_AUTH,
+        json={"resources": ["workout"], "restart": True},
+    )
+    assert response.status_code == 202
+    assert response.json()["started"] is True
+
+    status = gateway_client.get("/internal/sync/backfill", headers=GATEWAY_AUTH).json()
+    assert {r["resource"] for r in status["resources"]} == {
+        r.value for r in Resource if r not in (Resource.PERSONAL_INFO, Resource.RING_CONFIGURATION)
+    }
+
+
+def test_backfill_refuses_a_current_state_resource(gateway_client):
+    response = gateway_client.post(
+        "/internal/sync/backfill", headers=GATEWAY_AUTH, json={"resources": ["personal_info"]}
+    )
+
+    assert response.status_code == 400
 
 
 def test_resource_history_reports_a_bad_date_as_a_tool_error(client):
@@ -1065,3 +1177,101 @@ def test_a_wrong_owner_password_does_not_issue_a_code(oauth_client):
 
     assert response.status_code == 401
     assert "location" not in response.headers
+
+
+def test_the_scheduler_runs_a_sync_when_the_app_starts(config, fakes, monkeypatch, tmp_path):
+    import time
+
+    scheduled = config.replace("sync", interval_hours=6, resources=["ring_battery_level"])
+    with running_app(scheduled, fakes, monkeypatch, tmp_path):
+        deadline = time.monotonic() + 5
+        while not fakes["database"]["oura_records"].documents and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+    assert len(fakes["database"]["oura_records"].documents) == 2
+    assert any(k.startswith("oura:sync:schedule:default:") for k in fakes["redis"].store)
+
+
+# ── Ring wear ─────────────────────────────────────────────────────────────
+
+
+def _wearing_for_the_last_hour(stub_client: StubOuraClient) -> None:
+    """Make the stub Oura report an hour of worn activity slots ending now."""
+    from datetime import timedelta
+
+    started = datetime.now(UTC) - timedelta(hours=1)
+
+    async def fetch_range(token, resource, start, end):
+        stub_client.calls.append((resource, start, end))
+        if resource is Resource.DAILY_ACTIVITY:
+            return [{"id": "a1", "day": started.date().isoformat(), "timestamp": started.isoformat(),
+                     "class_5_min": "1" * 12, "non_wear_time": 0}]
+        return []
+
+    stub_client.fetch_range = fetch_range
+
+
+def test_the_wear_tools_are_advertised(client):
+    initialize(client)
+    tools = {t["name"] for t in rpc(client, "tools/list", request_id=2)["result"]["tools"]}
+
+    assert {"oura_wear_status", "oura_wear_intervals"} <= tools
+
+
+def test_wear_status_is_unknown_before_the_first_poll(client):
+    result = call_tool(client, "oura_wear_status")
+
+    structured = result["result"]["structuredContent"]
+    assert structured["status"] == "UNKNOWN"
+    assert structured["fresh"] is False
+
+
+def test_a_wear_poll_is_reported_by_the_route_and_the_tool(gateway_client, fakes):
+    _wearing_for_the_last_hour(fakes["oura"])
+
+    response = gateway_client.post("/internal/wear/poll", headers=GATEWAY_AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "WORN"
+    assert gateway_client.get("/api/wear/status", headers=GATEWAY_AUTH).json()["status"] == "WORN"
+    structured = call_tool(gateway_client, "oura_wear_status")["result"]["structuredContent"]
+    assert structured["status"] == "WORN"
+    assert structured["source"] == ["daily_activity"]
+
+    intervals = call_tool(gateway_client, "oura_wear_intervals")["result"]["structuredContent"]
+    assert [i["status"] for i in intervals["intervals"]] == ["WORN"]
+    assert [t["status"] for t in intervals["transitions"]] == ["WORN"]
+
+
+def test_wear_history_reports_a_bad_bound(gateway_client):
+    response = gateway_client.get("/api/wear/history?since=yesterday", headers=GATEWAY_AUTH)
+
+    assert response.status_code == 400
+
+
+def test_wear_backfill_reads_the_archive(gateway_client, fakes):
+    response = gateway_client.post("/internal/wear/backfill", headers=GATEWAY_AUTH, json={"since": "2026-01-01"})
+
+    assert response.status_code == 200
+    assert response.json() == {"days": 0, "updated": 0}
+    assert fakes["oura"].calls == []
+
+
+def test_wear_routes_refuse_without_gateway_auth_configured(client):
+    assert client.get("/api/wear/status", headers=AUTH).status_code == 503
+    assert client.post("/internal/wear/poll", headers=AUTH).status_code == 503
+
+
+def test_the_wear_poller_runs_when_the_app_starts(config, fakes, monkeypatch, tmp_path):
+    import time
+
+    _wearing_for_the_last_hour(fakes["oura"])
+    scheduled = config.replace("wear", poll_interval_minutes=15)
+    with running_app(scheduled, fakes, monkeypatch, tmp_path):
+        deadline = time.monotonic() + 5
+        while not fakes["database"]["wear_status"].documents and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+    (status,) = fakes["database"]["wear_status"].documents
+    assert status["status"] == "WORN"
+    assert any(k.startswith("oura:wear:schedule:default:") for k in fakes["redis"].store)

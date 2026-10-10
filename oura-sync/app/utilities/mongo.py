@@ -17,6 +17,11 @@ AUDIT_EVENTS = "audit_events"
 WEBHOOK_EVENTS = "webhook_events"
 REQUEST_LOG = "request_log"
 RESOURCE_SNAPSHOTS = "resource_snapshots"
+OURA_RECORDS = "oura_records"
+SYNC_STATE = "sync_state"
+WEAR_STATUS = "wear_status"
+WEAR_TRANSITIONS = "wear_transitions"
+WEAR_DAYS = "wear_days"
 
 # request_log is a firehose (every request, bot scans included), not a durable
 # audit trail -- see models.request_log -- so it self-prunes via a TTL index
@@ -66,3 +71,17 @@ async def ensure_indexes(database: AsyncDatabase) -> None:
     await database[RESOURCE_SNAPSHOTS].create_index(
         [("account_id", 1), ("resource", 1), ("first_seen_at", -1)]
     )
+    await database[OURA_RECORDS].create_index(
+        [("account_id", 1), ("resource", 1), ("record_key", 1)], unique=True
+    )
+    await database[OURA_RECORDS].create_index(
+        [("account_id", 1), ("resource", 1), ("observed_at", -1)]
+    )
+    await database[SYNC_STATE].create_index([("account_id", 1), ("resource", 1)], unique=True)
+    await database[WEAR_STATUS].create_index("account_id", unique=True)
+    await database[WEAR_TRANSITIONS].create_index(
+        [("account_id", 1), ("status", 1), ("at", 1)], unique=True
+    )
+    await database[WEAR_TRANSITIONS].create_index([("account_id", 1), ("at", -1)])
+    await database[WEAR_DAYS].create_index([("account_id", 1), ("day", 1)], unique=True)
+    await database[WEAR_DAYS].create_index([("account_id", 1), ("start", 1)])

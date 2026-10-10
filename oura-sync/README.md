@@ -7,10 +7,11 @@ The Oura Ring service: one Quart app that
   speaks the protocol) can ask about your sleep, readiness, activity, stress
   and workouts. Clients that only offer OAuth, such as ChatGPT, are supported
   too -- see [MCP OAuth](#mcp-oauth);
-- **polls the resources Oura cannot show history for** (ring configuration and
-  firmware, battery level, profile) and stores only the snapshots that
-  changed, so the MCP surface can answer "when did my firmware update" or
-  "chart my battery level this month" -- see [Snapshot sync](#snapshot-sync);
+- **archives every Oura resource into Mongo**, back-filled to the first ring
+  and deduplicated, plus a change log of what Oura only reports the current
+  value of (ring configuration and firmware, profile), so the MCP surface can
+  answer "when did my firmware update", "chart my battery level this month"
+  or "how has my sleep changed since 2021" -- see [Snapshot sync](#snapshot-sync);
 - handles the Oura OAuth connection, webhooks and a small admin API.
 
 ```
@@ -33,25 +34,26 @@ call, not an Azure AD-authenticated HTTP hop between two pods.
 
 1. [Architecture](#architecture)
 2. [Snapshot sync](#snapshot-sync)
-3. [The Oura client](#the-oura-client)
-4. [Local setup](#local-setup)
-5. [Registering an Oura OAuth application](#registering-an-oura-oauth-application)
-6. [Scopes](#scopes)
-7. [Connecting an account](#connecting-an-account)
-8. [Configuration](#configuration)
-9. [Running locally](#running-locally)
-10. [Connecting an MCP client](#connecting-an-mcp-client)
-11. [MCP tools](#mcp-tools)
-12. [Docker](#docker)
-13. [Helm](#helm)
-14. [Ingress considerations](#ingress-considerations)
-15. [Webhooks](#webhooks)
-16. [Token refresh and rotation](#token-refresh-and-rotation)
-17. [Testing](#testing)
-18. [Security](#security)
-19. [MCP OAuth](#mcp-oauth)
-20. [Migrating from oura-mcp + oura-sync](#migrating-from-oura-mcp--oura-sync)
-21. [Limitations](#limitations)
+3. [Ring wear status](#ring-wear-status)
+4. [The Oura client](#the-oura-client)
+5. [Local setup](#local-setup)
+6. [Registering an Oura OAuth application](#registering-an-oura-oauth-application)
+7. [Scopes](#scopes)
+8. [Connecting an account](#connecting-an-account)
+9. [Configuration](#configuration)
+10. [Running locally](#running-locally)
+11. [Connecting an MCP client](#connecting-an-mcp-client)
+12. [MCP tools](#mcp-tools)
+13. [Docker](#docker)
+14. [Helm](#helm)
+15. [Ingress considerations](#ingress-considerations)
+16. [Webhooks](#webhooks)
+17. [Token refresh and rotation](#token-refresh-and-rotation)
+18. [Testing](#testing)
+19. [Security](#security)
+20. [MCP OAuth](#mcp-oauth)
+21. [Migrating from oura-mcp + oura-sync](#migrating-from-oura-mcp--oura-sync)
+22. [Limitations](#limitations)
 
 ---
 
@@ -87,14 +89,18 @@ app/
   clients/            OuraApiClient, WebhookSubscriptionClient, OuraOAuthClient
   services/           OuraService, TokenService, CacheService, OAuthService, AuditService,
                       SummaryService, WebhookService, McpAuthService,
-                      SnapshotService, SyncService, HistoryService
+                      SnapshotService, SyncService, HistoryService, WearService,
+                      JobScheduler (APScheduler: sync, back-sync, wear poll)
+                      (+ wear_detection, its pure rules)
   repositories/       Mongo/Redis persistence: tokens, audit, oauth, webhooks,
-                      request log, snapshots
-  routes/             Quart blueprints: health, admin, oauth, webhooks, consent, sync, home
+                      request log, snapshots, wear
+  routes/             Quart blueprints: health, admin, oauth, webhooks, consent, sync,
+                      wear, home
   mcp/
     app.py            MCPServer + MCPBlueprint, endpoint auth (with_oauth / with_bearer)
     tools/            one module per area: summary, sleep, readiness, stress, activity,
-                      heart, battery, profile, query; common.py holds the audited runner
+                      heart, battery, profile, query, history, wear; common.py holds
+                      the audited runner
   models/             config.py (typed settings), Oura domain types, tool result shapes
   utilities/          provider.py (DI composition root), middleware (correlation id,
                       access + request log), auth guards, logging, crypto, Mongo, Redis,
@@ -111,8 +117,13 @@ its working directory.
 Entry points stay thin — accept input, call an injected service, return the
 result. Dependencies are wired once in `utilities/provider.py` using
 [pydepi](https://github.com/danleonard-nj/depi) and reach their consumers
-through ordinary constructors. Routes resolve from the container with
-`resolve(Service)`; MCP tools through the `ToolRunner` they are handed.
+through ordinary constructors. Views get theirs from depi's `QuartInjector`
+(`pydepi-quart`, autowired): a view declares `tokens: TokenService` and the
+injector supplies it. Blueprints are built by `create_*_blueprint(injector)`
+factories for that reason. MCP tools are called by the SDK rather than Quart,
+so they resolve through the `ToolRunner` they are handed. `Configuration` is
+registered as a singleton and each config section is a factory reading its
+key from it.
 
 Three composition details are load-bearing:
 
@@ -125,11 +136,11 @@ follow. There is a test pinning this.
 app never has its own lifespan run; `MCPBlueprint` registers a
 `while_serving` hook that runs `session_manager.run()` instead.
 
-**The DI provider is built in `before_serving`, not at import.**
+**The DI provider is created at assembly but built in `before_serving`.**
+The injector only needs to know what is registered, so views are wired when
+the app is assembled. Building constructs the factory registrations, and
 `AsyncMongoClient` and `redis.asyncio.Redis` bind to the loop that creates
-them; building at import time binds them to a throwaway loop. Routes and MCP
-tools are registered before that, against a `ContainerProvider` the provider
-is bound to at startup.
+them -- so `build_async()` waits for the serving loop.
 
 ### Data flow for one tool call
 
@@ -145,18 +156,19 @@ tools/call
 
 ### What is stored where
 
-**Mongo** holds durable operational data: `oauth_tokens` (your encrypted Oura
-tokens), `audit_events`, `webhook_events`, `request_log` (a week, TTL-pruned),
-`resource_snapshots` (see [Snapshot sync](#snapshot-sync)), plus
+**Mongo** holds `oauth_tokens` (your encrypted Oura tokens), `audit_events`,
+`webhook_events`, `request_log` (a week, TTL-pruned), the synced copy of your
+Oura data in `oura_records` and `resource_snapshots` with its progress in
+`sync_state` (see [Snapshot sync](#snapshot-sync)), `wear_days`,
+`wear_status` and `wear_transitions` (see [Ring wear status](#ring-wear-status)), plus
 `oauth_clients` and `oauth_refresh_tokens` when MCP OAuth is on. The database
 is still named `oura_mcp`, so nothing had to move when the services merged.
 
-**Health data is deliberately not copied into Mongo.** Oura is the system of
-record, Redis already absorbs repeat reads, and webhooks keep that cache
-honest. Mirroring the dataset would add a sync problem, a correctness problem
-and a pile of personal health information at rest, in exchange for nothing this
-service needs. The one exception is `resource_snapshots`, for the three
-resources Oura itself keeps no history for -- see below.
+**MCP tools still read Oura live.** The synced copy exists so data Oura
+forgets (battery samples, firmware history) is not lost, and so long-range
+questions need no Oura calls; the tools answer from
+Oura, through the Redis cache, except `oura_resource_history`, which reads the
+copy.
 
 **Redis** does four jobs: the distributed Oura-token refresh lock (mandatory),
 response caching (optional), webhook deduplication (optional), and the
@@ -167,36 +179,110 @@ and access tokens. Only the refresh lock is required for correctness.
 
 ## Snapshot sync
 
-Three resources have no real history behind them in Oura's live API:
+Oura does not keep everything forever -- ring battery samples in particular
+only stick around briefly -- so every few hours the service copies what Oura
+has into Mongo:
 
-| Resource             | What Oura's live API gives you                                                   |
-| -------------------- | -------------------------------------------------------------------------------- |
-| `ring_configuration` | Current model, colour, firmware version, setup date -- no history                |
-| `ring_battery_level` | Accepts a date range, but Oura does not durably retain a long history behind it |
-| `personal_info`      | Current profile only -- no history                                               |
+- **Record archive** (`oura_records`): every collection with records in time
+  -- daily scores, sleep periods, workouts, sessions, tags, heart rate and
+  battery samples. One document per Oura record, upserted by its `id` (or its
+  timestamp, for time series), so overlapping runs never duplicate anything
+  and a record Oura revises later (a sleep score finalised the next morning)
+  is updated in place.
+- **Change log** (`resource_snapshots`): `ring_configuration` and
+  `personal_info`, which Oura reports only the current value of. A new
+  document is stored only when the value changes, so it answers "when did my
+  firmware update".
 
-Polling on a cadence and keeping only the snapshots that actually differ from
-the last one gives a genuine change history for all three, without storing
-health data Oura already tracks properly (sleep, readiness, activity, ...).
-The `oura_resource_history` MCP tool reads it.
+The `oura_resource_history` MCP tool and `GET /api/history/<resource>` read
+both: archived records for every collection, the change log for
+configuration and profile.
+
+**When it runs.** The [scheduler](#scheduling) runs a sync every
+`sync.interval_hours` (6 by default; 0 turns it off). Each run fetches from
+the last day that resource synced successfully (`sync_state.synced_through`)
+or the last `sync.lookback_days` (2 by default), whichever reaches further
+back -- so an outage of any length leaves no gap, and revised records keep
+being re-read. `sync.resources`
+defaults to every resource; one whose scope is not granted just fails on its
+own.
+
+**Windows.** A range wider than `sync.chunk_days` (90) is fetched a window
+at a time; heart rate is capped at `oura.max_heartrate_days` (14). A window
+that needs more than `MAX_PAGES` pages raises rather than archiving a partial
+result, and the sync halves it until it fits.
+
+### Scheduling
+
+Periodic work runs in-process on [APScheduler](https://apscheduler.readthedocs.io/en/3.x/)
+(`services/scheduler.py`, `JobScheduler`), started in `before_serving` and
+stopped in `after_serving`:
+
+| Job        | Every                                  | Off when                             |
+| ---------- | -------------------------------------- | ------------------------------------ |
+| `sync`     | `sync.interval_hours` (6)              | `sync.interval_hours` is 0           |
+| `backfill` | hour                                   | `sync.backfill_enabled` is false     |
+| `wear`     | `wear.poll_interval_minutes` (15)      | `wear.poll_interval_minutes` is 0    |
+
+APScheduler decides *when*: each job runs once at startup, then on interval
+boundaries counted from the epoch, so every replica ticks at the same
+instants -- the ring check at :00, :15, :30 and :45, the sync at 00:00,
+06:00, 12:00 and 18:00 UTC. Redis decides *who*: each interval is claimed
+by the first replica to reach it (`oura:<job>:schedule:<account>:<n>`), so
+however many replicas run and however often a pod restarts, a job runs at
+most once per interval -- and a startup run never pushes the next scheduled
+one back. Without Redis a claimed job is skipped rather than risked twice.
+The back-sync is unclaimed; it holds its own lease for the length of a
+walk. Overruns coalesce instead of queueing (`max_instances=1`), and a job's
+failure is logged without stopping the schedule.
+
+### Back-sync
+
+The regular sync only reads forward from its first run. The back-sync fills
+in everything older: for each archived resource it walks back from today one
+window at a time, newest first, until it reaches the floor:
+
+1. `sync.backfill_start`, if configured;
+2. otherwise the setup day of the earliest ring in `ring_configuration` --
+   there is no ring data from before a ring existed;
+3. failing both, it stops after `sync.backfill_empty_chunks` (4) empty
+   windows in a row. It never walks past 2015-01-01.
+
+Progress is saved to `sync_state` after every window, so a restart or a
+failure resumes where it stopped, and a finished resource costs no Oura calls
+on later passes. A Redis lease, refreshed after every window, keeps replicas
+from walking at the same time. A rate limit ends the pass; any other error
+only skips that resource until the next one. The [scheduler](#scheduling)
+runs it at startup and then hourly (`sync.backfill_enabled`, on by default). Current-state resources
+have no history in Oura's API, so they are not walked. Battery samples older
+than Oura's own retention are gone upstream and cannot be recovered -- the
+archive only keeps them from here on.
 
 | Route                       | Method | Auth                  | Purpose                                            |
 | --------------------------- | ------ | --------------------- | -------------------------------------------------- |
-| `/internal/sync/run`        | POST   | Azure AD bearer token | Poll the configured (or requested) resources       |
-| `/api/snapshots/<resource>` | GET    | Azure AD bearer token | Historical snapshots of one resource, oldest first |
+| `/internal/sync/run`        | POST   | Azure AD bearer token | Run a sync now (for the external scheduler)        |
+| `/internal/sync/backfill`   | GET    | Azure AD bearer token | Back-sync progress per resource                    |
+| `/internal/sync/backfill`   | POST   | Azure AD bearer token | Start a back-sync in the background (202)          |
+| `/api/history/<resource>`   | GET    | Azure AD bearer token | Stored history of any synced resource, oldest first |
+| `/api/snapshots/<resource>` | GET    | Azure AD bearer token | Change-log snapshots of one resource, oldest first |
 
 `POST /internal/sync/run` takes an optional JSON body,
-`{"resources": ["ring_battery_level"]}`, to override the default list from
-`sync.resources`. Returns `{"results": [{"resource": ..., "changed": bool}, ...]}`,
-with a per-resource `"error"` key instead of stopping the whole run if one
-resource fails.
+`{"resources": ["ring_battery_level"]}`, to override `sync.resources`. It
+returns one result per resource -- `{"resource", "start_date", "end_date",
+"fetched", "inserted", "updated"}` for archived ones, `{"resource",
+"changed"}` for the change log -- with an `"error"` key instead of stopping
+the whole run if one resource fails. Once the external scheduler calls it,
+set `sync.interval_hours` to 0; running both is harmless, just redundant.
 
-`GET /api/snapshots/<resource>` takes `since`/`until` (ISO-8601, filtering on
-when a snapshot was first seen) and `limit` (default 100, max 1000). Returns
-`{"count": N, "snapshots": [{"resource", "content_hash", "payload",
-"first_seen_at", "last_seen_at"}, ...]}`. Nothing in this service calls it
-any more -- the MCP tool reads the repository directly -- but it is kept for
-anything outside the cluster that wants the raw history.
+`POST /internal/sync/backfill` takes `{"resources": [...], "restart": true}`,
+both optional; `restart` forgets saved progress so the walk starts again from
+today. It answers 409 if this replica is already walking.
+
+`GET /api/history/<resource>` takes `since`/`until` (ISO-8601 dates or
+datetimes, inclusive; a bare `until` date covers the whole day) and `limit`
+(default 1000, max 5000; the most recent records win when the window holds
+more). `GET /api/snapshots/<resource>` takes `since`/`until` (filtering on
+when a snapshot was first seen) and `limit` (default 100, max 1000).
 
 ### Gateway auth
 
@@ -208,28 +294,103 @@ other through the API gateway. With `auth.tenant_id`/`auth.audiences` unset both
 routes always return `503 not_configured`; there is no unauthenticated
 fallback, and `mcp.api_key` is not accepted on them.
 
-### No internal scheduler
+---
 
-`/internal/sync/run` is a plain POST endpoint; nothing in this repo decides
-when it runs. An external scheduler (a C# cron job, in this deployment) calls
-it on whatever cadence it likes. There is no APScheduler and no CronJob in
-the chart -- an in-process timer would compete with the web server for the
-event loop, and with more than one replica would run once per pod.
+## Ring wear status
 
-### Storage: change log, not poll log
+Every `wear.poll_interval_minutes` (15) the service judges whether the ring
+is on a finger -- `WORN`, `NOT_WORN` or `UNKNOWN` -- and keeps the history
+of it, so "when did I take it off" and "how many hours did I wear it this
+week" have answers. Code: `services/wear_detection.py` (the rules, pure) and
+`services/wear_service.py` (fetching and persisting), run by the
+[scheduler](#scheduling) at :00, :15, :30 and :45.
 
-Each poll fetches a resource live from Oura (bypassing the response cache --
-a cache hit would look like "nothing changed" even when it did), hashes the
-payload, and compares it to the most recent stored snapshot for that
-`(account_id, resource)`. Identical payloads never create a new document --
-`last_seen_at` is bumped on the existing one instead. Only a genuine change
-inserts a new row. This bounds storage growth regardless of poll frequency
-and gives a real "when did this change" answer, not "how many times did we
-poll".
+**This is not live device status.** Oura's API only holds what the ring last
+synced through the phone, in the background, sometimes hours late. Every
+answer is as of `latest_evidence_at`; once that is older than
+`wear.max_evidence_age_minutes` (60) the status reads `UNKNOWN` -- checked
+again on every read, so an outage cannot leave a stale `WORN` on display.
 
-For the two date-ranged resources (`ring_configuration`, `ring_battery_level`),
-one poll fetches *today's* record(s) and stores the most recent one -- a day
-can have more than one entry (battery level sampled repeatedly, for example).
+### Evidence, as verified against the live API
+
+- **`daily_activity.class_5_min`** -- one character per 5 minutes:
+  `0` non-wear, `1` rest, `2` inactive, `3` low, `4` medium, `5` high
+  activity (Oura's OpenAPI spec, v1.41). The activity day is "a 24-hour
+  period starting at 4 a.m." local; `timestamp` is that 04:00 with its UTC
+  offset, and slot *i* covers `timestamp + 5i` minutes. **Today's record is
+  published while the day is in progress**: the string ends at the last
+  synced slot (70 characters at 09:50) while `met` is padded to 1440, so its
+  length is a sync-freshness signal. `'0'` count x 300 s tracks
+  `non_wear_time`, and `'0'` runs line up with gaps in heart rate.
+- **`heartrate`** -- positive evidence only. No pulse is read off a finger,
+  but the ring does not sample continuously while worn either (hour-long
+  daytime gaps are normal), so a missing sample never means it is off.
+- **`daily_activity` treats `end_date` as exclusive** (unlike `daily_sleep`):
+  `start_date=end_date=D` returns nothing. The poller asks for today + 2.
+
+### Rules
+
+| Newest evidence (all within `max_evidence_age_minutes`)                          | Status     | Confidence |
+| -------------------------------------------------------------------------------- | ---------- | ---------- |
+| Nothing recent, or no data at all                                                | `UNKNOWN`  | low        |
+| Heart rate newer than every classified slot                                      | `WORN`     | medium     |
+| Trailing worn slots, with heart rate during them and both fresh                  | `WORN`     | high       |
+| Trailing worn slots without heart rate, or heart rate with no activity data      | `WORN`     | medium     |
+| Trailing non-wear run of at least `min_non_wear_minutes` (15), no pulse since    | `NOT_WORN` | high from twice the threshold with heart rate checked, else medium |
+| Trailing non-wear run with heart rate inside it (beyond its first slot)          | `UNKNOWN`  | low        |
+| Trailing non-wear run shorter than the threshold                                 | `UNKNOWN`  | low        |
+
+`since` is when the current period began: the first non-wear slot of a
+removal, the first worn slot (or first new pulse) after one. Non-wear blips
+shorter than the threshold between worn stretches do not reset it.
+
+### Persistence and idempotency
+
+- `wear_days` -- each activity day's 04:00 start and `class_5_min`, the
+  whole wear history. A day is only replaced by one covering at least as many
+  slots, so a short or partial response never erases stored evidence.
+- `wear_status` -- the current judgement: status, confidence, reason,
+  source, `since`, `last_worn_at`, `latest_evidence_at`,
+  `activity_through`, `heart_rate_through`, `checked_at`, `last_error`.
+- `wear_transitions` -- each change between `WORN` and `NOT_WORN`, at the
+  evidence time it happened, unique per (status, time). Flickers through
+  `UNKNOWN` are not transitions, and re-polling the same evidence adds none.
+
+Judgement always runs over the *stored* days plus the last heart-rate time
+already known, so a failed or partial poll can add evidence but never take
+it away. Each source is fetched on its own: a failing one is recorded in
+`last_error` and lowers confidence (heart rate) or falls back to stored days
+(activity). A failure is logged once when it starts and once when it
+recovers, not every poll. Each 15-minute interval is claimed in Redis, so
+replicas never poll twice.
+
+### Delayed sync and backfill
+
+Each poll re-reads `wear.lookback_days` (3) of activity, so a ring that
+syncs late fills in the days it missed. For anything older, `POST
+/internal/wear/backfill` derives wear days from the record archive (which
+the [back-sync](#back-sync) fills to the first ring) -- no Oura calls,
+safe to repeat.
+
+| Route                     | Method | Auth                  | Purpose                                                                   |
+| ------------------------- | ------ | --------------------- | ------------------------------------------------------------------------- |
+| `/api/wear/status`        | GET    | Azure AD bearer token | Current status, with evidence age and freshness                           |
+| `/api/wear/history`       | GET    | Azure AD bearer token | Intervals, totals and transitions; `since`/`until` (default: last 7 days) |
+| `/internal/wear/poll`     | POST   | Azure AD bearer token | Poll now                                                                  |
+| `/internal/wear/backfill` | POST   | Azure AD bearer token | Optional `{"since", "until"}`; derive history from the archive            |
+
+MCP: `oura_wear_status` and `oura_wear_intervals`.
+
+To check it end to end, poll and read it back:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $GATEWAY_TOKEN" https://oura.example.com/internal/wear/poll | jq
+curl -s -H "Authorization: Bearer $GATEWAY_TOKEN" "https://oura.example.com/api/wear/history?since=2026-10-01" | jq .intervals
+```
+
+Take the ring off for 20 minutes, open the Oura app so it syncs, and poll
+again: `NOT_WORN` with `since` at the removal. Put it back on, sync, poll:
+`WORN`, and two new rows in `transitions`.
 
 ---
 
@@ -459,7 +620,8 @@ value).
 | `mcp`      | `api_key`                         | `path`, `stateless`, `extra_allowed_hosts`, `request_state_secrets` (needed with >1 replica; see [Scaling](#scaling)), `oauth.owner_password` (enables [MCP OAuth](#mcp-oauth)) |
 | `webhooks` | —                                 | `verification_token` (required to accept webhook subscriptions)                                        |
 | `cache`    | —                                 | `enabled`, TTLs                                                                                        |
-| `sync`     | —                                 | `resources` (default resources for `POST /internal/sync/run`)                                          |
+| `sync`     | —                                 | `resources` (default: all), `interval_hours`, `lookback_days`, `chunk_days`, `backfill_enabled`, `backfill_start`, `backfill_empty_chunks` -- see [Back-sync](#back-sync) |
+| `wear`     | —                                 | `poll_interval_minutes` (0 turns it off), `lookback_days`, `heart_rate_lookback_hours`, `max_evidence_age_minutes`, `min_non_wear_minutes` -- see [Ring wear status](#ring-wear-status) |
 | `auth`     | —                                 | `tenant_id`, `audiences`, `required_role` -- gateway auth on the sync routes; unset, they always refuse |
 
 `auth` has the same shape as framework's own `auth` section, so the file reads
@@ -589,7 +751,7 @@ curl -sS https://oura.example.com/mcp \
 
 ## MCP tools
 
-Sixteen tools, all read-only. There are no write operations to Oura anywhere in
+Nineteen tools, all read-only. There are no write operations to Oura anywhere in
 the MCP surface.
 
 | Tool                      | Returns                                                                             | Default range  |
@@ -609,8 +771,11 @@ the MCP surface.
 | `oura_tags`               | User-entered tags                                                                   | 14 days        |
 | `oura_ring_info`          | Ring model, size, firmware                                                          | 30 days        |
 | `oura_personal_info`      | Age, sex, height, weight                                                            | —              |
-| `oura_resource_history`   | Historical snapshots of ring config/firmware, battery level, or profile — see below | all history    |
+| `oura_resource_history`   | Stored history of any resource from the synced archive — see below                  | all history    |
+| `oura_wear_status`        | Whether the ring is worn now, with confidence and evidence age                      | —              |
+| `oura_wear_intervals`     | Worn / not-worn intervals, totals and detected removals                             | 7 days         |
 | `oura_query`              | Any collection by name, for the long tail                                           | 7 days         |
+| `oura_clear_cache`        | Drop cached responses (all, or named resources) so the next call reads live         | —              |
 
 `oura_summary` is the one to reach for first: it fans out across six
 collections concurrently and joins them on the calendar day, so "how did I
@@ -623,13 +788,13 @@ per-period sessions), `sleep_time`, `tag` (legacy format), `rest_mode_period`
 and `ring_battery_level`. Keeping them behind one tool avoids five more
 schemas for rarely-asked questions.
 
-`oura_resource_history` answers what the live Oura API cannot: it has no
-history endpoint for things like ring configuration/firmware, and while
-`ring_battery_level` accepts a date range, Oura does not durably retain a long
-battery history behind it. The [snapshot sync](#snapshot-sync) polls those
-three resources on a cadence and stores only the snapshots that changed; this
-tool reads them (see `services/history_service.py`). `until` is inclusive: a
-bare date covers that whole day.
+`oura_resource_history` reads the [synced archive](#snapshot-sync) rather
+than Oura: every collection's records, back-filled to the first ring, plus the
+change log for ring configuration/firmware and the profile, which Oura has no
+history endpoint for. It reaches what Oura no longer returns -- battery
+samples above all -- and spans years without Oura's range limits (see
+`services/history_service.py`). `until` is inclusive: a bare date covers that
+whole day.
 
 Every tool returns a typed Pydantic model, so clients get real structured
 content and a real output schema — not stringified JSON.
@@ -1009,8 +1174,10 @@ rest; webhook signature accept/reject and tampering; deduplication; cache
 hit/miss/bypass/invalidation; MCP bearer auth; the full MCP OAuth flow
 (register, authorize, consent, token, call); the `/mcp` no-redirect
 guarantee; DNS-rebinding rejection; a sync run storing a snapshot that
-`oura_resource_history` then returns; Azure AD token validation; and health
-and readiness behaviour.
+`oura_resource_history` then returns; ring removal and replacement,
+heart-rate gaps, stale and late-syncing data, the 04:00 activity-day
+boundary, repeated polls, backfill and conflicting evidence; Azure AD token
+validation; and health and readiness behaviour.
 
 ---
 
@@ -1202,22 +1369,22 @@ tokens (stored in Mongo and Redis, not in the pod) all carry over.
 - **Document-by-id lookups are not surfaced as a tool.** `OuraService.get_document`
   exists and works, but no tool calls it — webhooks carry an `object_id`, and
   nothing yet needs to fetch by it.
-- **No local historical store of health data.** By design; see
-  [Architecture](#what-is-stored-where). The snapshot change log covers only
-  the three resources Oura keeps no history for.
-- **Only three resources are snapshotted** (`ring_configuration`,
-  `ring_battery_level`, `personal_info`). Adding another means adding it to
-  `sync.resources`, `TRACKED_RESOURCES` and, if it is not date-ranged,
-  `SnapshotService`'s singleton branch.
-- **No snapshot retention policy.** A change log grows only on real changes,
-  which for these resources should be rare -- but nothing caps it.
+- **The synced copy has no retention policy.** It grows with your data --
+  heart rate is a few hundred samples a day -- and nothing prunes it.
+- **The back-sync can only reach what Oura still has.** Battery samples Oura
+  had already dropped before the first run are gone.
+- **Only `oura_resource_history` reads the copy.** The other tools read Oura
+  live.
+- **Ring wear status lags the ring.** It is only as fresh as the ring's last
+  sync through the phone; with the phone away it reads `UNKNOWN`, by design.
+  A `daily_activity` webhook could trigger a poll sooner; nothing wires that
+  up yet. Charging is non-wear, as Oura classifies it.
 - **Webhook events are not proactively fetched.** A notification invalidates
-  the cache and is recorded; the next tool call fetches fresh data. Prefetching
-  would mean storing health data locally, which this service does not do.
+  the cache and is recorded; the next tool call fetches fresh data, and the
+  next sync archives it.
 - **Webhook subscriptions are not auto-renewed.** They expire; the renew
-  endpoint exists but nothing calls it on a schedule. A CronJob hitting
-  `/api/webhooks/subscriptions/<id>/renew` would close this, but adding a
-  scheduler for one periodic call did not seem worth it yet.
+  endpoint exists but nothing calls it on a schedule. One more
+  `JobScheduler` job would close this.
 - **`x-oura-timestamp` is not checked for freshness.** Oura does not document a
   tolerance window, and rejecting on clock skew would drop valid events. Redis
   deduplication already blocks replays within its TTL.

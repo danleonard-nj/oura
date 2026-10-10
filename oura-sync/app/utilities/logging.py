@@ -131,8 +131,9 @@ def configure_logging(level: str = "INFO") -> None:
     # the same request the audit service logs as `oura_request` with the
     # status, timing and resource already attached. urllib3/requests/pymongo
     # are transitive dependencies with the same problem, and their payloads
-    # can contain URLs with query strings.
-    for noisy in ("httpx2", "urllib3", "requests", "pymongo"):
+    # can contain URLs with query strings. APScheduler logs every run of
+    # every job at INFO; its misfire and failure warnings still come through.
+    for noisy in ("httpx2", "urllib3", "requests", "pymongo", "apscheduler"):
         logging.getLogger(noisy).setLevel(max(logging.WARNING, root.level))
 
 

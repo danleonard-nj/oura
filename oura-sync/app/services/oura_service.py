@@ -31,6 +31,7 @@ from app.models.errors import (
     OuraNotFoundError,
     OuraPermissionError,
     OuraRateLimitError,
+    OuraTruncatedError,
     OuraUpstreamError,
     OuraValidationError,
 )
@@ -259,7 +260,8 @@ class OuraService:
         )
 
     def _should_retry(self, error: OuraError, attempt: int) -> bool:
-        if attempt >= self._max_attempts:
+        if attempt >= self._max_attempts or isinstance(error, OuraTruncatedError):
+            # The same range would truncate the same way again.
             return False
         return error.status_code in RETRYABLE_STATUSES or isinstance(error, OuraUpstreamError)
 

@@ -22,6 +22,24 @@ class DateRange:
         for offset in range(self.days):
             yield self.start + timedelta(days=offset)
 
+    def chunks(self, days: int) -> list["DateRange"]:
+        """Consecutive windows of at most `days` days covering this range, oldest first."""
+        windows = []
+        start = self.start
+        while start <= self.end:
+            end = min(self.end, start + timedelta(days=days - 1))
+            windows.append(DateRange(start=start, end=end))
+            start = end + timedelta(days=1)
+        return windows
+
+    def halves(self) -> tuple["DateRange", "DateRange"]:
+        """Two ranges splitting this one; only meaningful when it spans 2+ days."""
+        middle = self.start + timedelta(days=self.days // 2 - 1)
+        return (
+            DateRange(start=self.start, end=middle),
+            DateRange(start=middle + timedelta(days=1), end=self.end),
+        )
+
     def as_params(self) -> dict[str, str]:
         return {"start_date": self.start.isoformat(), "end_date": self.end.isoformat()}
 

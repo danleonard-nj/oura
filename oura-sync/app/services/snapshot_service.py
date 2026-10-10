@@ -1,21 +1,21 @@
-"""Fetch one resource live from Oura and store it only if it changed.
+"""Keep a change log of resources Oura reports only the current value of.
 
-Reuses `OuraService` for the actual fetch, so token refresh, the 401
-retry-once path and error translation are the same code the MCP tools run
-on -- this only adds the hash-diff-and-store step on top.
+Ring configuration (model, firmware) and the profile have no history behind
+them in Oura's API: a firmware update or a new weight simply replaces what was
+there. Each sync fetches the current value and stores it only if it differs
+from the last snapshot, so `resource_snapshots` answers "when did this change".
+
+Reuses `OuraService` for the fetch, so token refresh, the 401 retry-once path
+and error translation are the same code the MCP tools run on.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-from datetime import date
-
-from app.models.dates import DateRange, today_utc
+from app.models.dates import DateRange
 from app.models.resources import Resource
-from app.services.oura_service import OuraService
-
 from app.repositories.snapshot_repository import SnapshotRepository
+from app.services.oura_service import OuraService
+from app.services.record_service import content_hash
 
 
 class SnapshotService:
@@ -23,36 +23,22 @@ class SnapshotService:
         self._oura = oura
         self._repository = repository
 
-    async def sync_one(self, resource: Resource) -> dict:
+    async def sync_one(self, resource: Resource, date_range: DateRange) -> dict:
         """Fetch `resource` live and store it if it differs from the last snapshot.
 
         Always bypasses the response cache -- the whole point is a live read
         that can actually detect a change, not a cached one from the last poll.
         """
-        account_id = self._oura.account_id
-
         if resource is Resource.PERSONAL_INFO:
             fetch = await self._oura.get_personal_info(use_cache=False)
             payload = fetch.records
         else:
-            today: date = today_utc()
-            fetch = await self._oura.get_records(
-                resource, DateRange(start=today, end=today), use_cache=False
-            )
-            records = fetch.records if isinstance(fetch.records, list) else []
-            if not records:
-                return {"resource": resource.value, "changed": False, "reason": "no data yet today"}
-            # The most recent record Oura has for today; a day can have more
-            # than one entry (e.g. battery level sampled repeatedly).
-            payload = records[-1]
+            fetch = await self._oura.get_records(resource, date_range, use_cache=False)
+            payload = fetch.records if isinstance(fetch.records, list) else [fetch.records]
+            if not payload:
+                return {"resource": resource.value, "changed": False, "reason": "no records in window"}
 
-        content_hash = _hash(payload)
         _document, changed = await self._repository.upsert_if_changed(
-            account_id, resource.value, payload, content_hash
+            self._oura.account_id, resource.value, payload, content_hash(payload)
         )
         return {"resource": resource.value, "changed": changed}
-
-
-def _hash(payload: object) -> str:
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(canonical.encode()).hexdigest()

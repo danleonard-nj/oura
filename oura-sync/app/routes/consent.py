@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import html
 
+from depi_quart import QuartInjector
 from quart import Blueprint, Response, redirect, request
 
 from app.models.config import McpConfig
@@ -22,71 +23,73 @@ from app.services.mcp_auth_service import (
     McpAuthService,
 )
 from app.utilities.logging import get_logger
-from app.utilities.provider import resolve
 
 logger = get_logger(__name__)
 
-consent_bp = Blueprint("consent", __name__)
 
+def create_consent_blueprint(injector: QuartInjector) -> Blueprint:
+    consent_bp = Blueprint("consent", __name__)
 
-@consent_bp.route(CONSENT_PATH, methods=["GET"])
-async def show_consent():
-    if not resolve(McpConfig).oauth.enabled:
-        return _page("Not available", "MCP OAuth is not enabled on this server.", status=404)
+    @consent_bp.route(CONSENT_PATH, methods=["GET"])
+    @injector.inject
+    async def show_consent(mcp: McpConfig, service: McpAuthService):
+        if not mcp.oauth.enabled:
+            return _page("Not available", "MCP OAuth is not enabled on this server.", status=404)
 
-    txn = request.args.get("txn", "")
-    service = resolve(McpAuthService)
-    pending = await service.pending_request(txn)
+        txn = request.args.get("txn", "")
+        pending = await service.pending_request(txn)
 
-    if pending is None:
+        if pending is None:
+            return _page(
+                "Request expired",
+                "This authorization request has expired or was already completed. "
+                "Start again from your MCP client.",
+                status=400,
+            )
+
         return _page(
-            "Request expired",
-            "This authorization request has expired or was already completed. "
-            "Start again from your MCP client.",
-            status=400,
+            "Authorize access",
+            None,
+            status=200,
+            body=_form(txn, pending),
         )
 
-    return _page(
-        "Authorize access",
-        None,
-        status=200,
-        body=_form(txn, pending),
-    )
+    @consent_bp.route(CONSENT_PATH, methods=["POST"])
+    @injector.inject
+    async def submit_consent(mcp: McpConfig, service: McpAuthService):
+        if not mcp.oauth.enabled:
+            return _page("Not available", "MCP OAuth is not enabled on this server.", status=404)
 
+        form = await request.form
+        txn = str(form.get("txn", ""))
 
-@consent_bp.route(CONSENT_PATH, methods=["POST"])
-async def submit_consent():
-    if not resolve(McpConfig).oauth.enabled:
-        return _page("Not available", "MCP OAuth is not enabled on this server.", status=404)
+        if form.get("action") == "deny":
+            target = await service.deny_consent(txn)
+            if target is None:
+                return _page("Request expired", "Nothing to deny; the request had already gone.", status=400)
+            return redirect(target, 302)
 
-    form = await request.form
-    txn = str(form.get("txn", ""))
-    service = resolve(McpAuthService)
+        # Rate limiting is keyed on the transaction, not the client address: behind
+        # an ingress every request shares a source IP, so per-IP counting would
+        # either lock out everyone at once or nobody.
+        try:
+            target = await service.approve_consent(
+                txn_id=txn,
+                password=str(form.get("password", "")),
+                attempt_key=txn,
+            )
+        except ConsentLockedOut as exc:
+            return _page("Locked out", str(exc), status=429)
+        except ConsentError as exc:
+            pending = await service.pending_request(txn)
+            if pending is None:
+                return _page("Request expired", str(exc), status=400)
+            return _page("Authorize access", None, status=401, body=_form(txn, pending, error=str(exc)))
 
-    if form.get("action") == "deny":
-        target = await service.deny_consent(txn)
-        if target is None:
-            return _page("Request expired", "Nothing to deny; the request had already gone.", status=400)
         return redirect(target, 302)
 
-    # Rate limiting is keyed on the transaction, not the client address: behind
-    # an ingress every request shares a source IP, so per-IP counting would
-    # either lock out everyone at once or nobody.
-    try:
-        target = await service.approve_consent(
-            txn_id=txn,
-            password=str(form.get("password", "")),
-            attempt_key=txn,
-        )
-    except ConsentLockedOut as exc:
-        return _page("Locked out", str(exc), status=429)
-    except ConsentError as exc:
-        pending = await service.pending_request(txn)
-        if pending is None:
-            return _page("Request expired", str(exc), status=400)
-        return _page("Authorize access", None, status=401, body=_form(txn, pending, error=str(exc)))
+    return consent_bp
 
-    return redirect(target, 302)
 
 
 def _form(txn: str, pending: dict, error: str | None = None) -> str:
@@ -154,4 +157,3 @@ def _page(title: str, message: str | None, *, status: int, body: str = "") -> Re
         content_type="text/html; charset=utf-8",
         headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
     )
-

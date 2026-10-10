@@ -65,3 +65,13 @@ class Summary(BaseModel):
             "be missing because the account lacks the scope or an Oura subscription."
         ),
     )
+
+
+class CacheCleared(BaseModel):
+    """Outcome of clearing cached Oura responses."""
+
+    cleared: list[str] = Field(description="Resources whose cached responses were dropped.")
+    failed: list[str] = Field(
+        default_factory=list,
+        description="Resources that could not be cleared because the cache was unreachable.",
+    )

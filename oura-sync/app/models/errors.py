@@ -96,3 +96,14 @@ class TokenRefreshUnavailableError(TokenRefreshError):
 
 class DateRangeError(OuraValidationError):
     """The requested date range is malformed or too expensive to serve."""
+
+
+class OuraTruncatedError(OuraError):
+    """A range needed more pages than `MAX_PAGES`, so the result would be partial.
+
+    Raised rather than returning what arrived: a silently short result would
+    be archived as if it were complete. Not retried -- the same range would
+    truncate again. The sync splits the range and tries the halves.
+    """
+
+    status_code = 502

@@ -4,3 +4,4 @@
 /.env.prod
 /.env.prod.bak-scopes
 /.env.bak-scopes
+oura-sync/config.example.json

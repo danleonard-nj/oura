@@ -6,19 +6,22 @@ is dropped into the build by CI/CD, the same as kube-tools-api. See
 `config.example.json` for its shape and the README for generating the secrets
 in it.
 
-Each top-level key of the file is one section below, validated into its model
-once at startup (see `bind_sections`) and registered in DI, so a service takes
-exactly the section it needs -- `OuraConfig`, `McpConfig`, ... -- rather than a
-grab-bag of every setting.
+Each top-level key of the file is one section below. `Configuration` is
+registered in DI, and each section is a factory reading its key from it (see
+`utilities/provider.py`), so a service takes exactly the section it needs --
+`OuraConfig`, `McpConfig`, ... -- rather than a grab-bag of every setting.
 """
 
 from __future__ import annotations
+
+from datetime import date
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
 from app.models.resources import Resource
 
 __all__ = [
+    "bind_section",
     "CacheConfig",
     "ConfigurationError",
     "DEFAULT_SCOPES",
@@ -32,6 +35,7 @@ __all__ = [
     "ServiceConfig",
     "SyncConfig",
     "TokenConfig",
+    "WearConfig",
     "WebhookConfig",
     "bind_sections",
 ]
@@ -47,11 +51,8 @@ DEFAULT_SCOPES = (
     "stress heart_health ring_configuration"
 )
 
-DEFAULT_SYNC_RESOURCES = [
-    Resource.RING_CONFIGURATION,
-    Resource.RING_BATTERY_LEVEL,
-    Resource.PERSONAL_INFO,
-]
+#: Everything Oura exposes. Ungranted scopes just fail that resource's sync.
+DEFAULT_SYNC_RESOURCES = list(Resource)
 
 
 class _Section(BaseModel):
@@ -280,13 +281,55 @@ class McpConfig(_Section):
 
 
 class SyncConfig(_Section):
-    """`sync`: the snapshot sync."""
+    """`sync`: copying Oura data into Mongo before Oura forgets it."""
 
-    # Polled by POST /internal/sync/run when the caller does not override the
-    # list. Not derived from `ResourceSpec.static` -- that flag drives the
-    # cache-TTL choice, a different concern, and would silently exclude
-    # ring_battery_level (see models/resources.py).
+    # Resources each sync run covers. Defaults to all of them.
     resources: list[Resource] = Field(default_factory=lambda: list(DEFAULT_SYNC_RESOURCES))
+    # How often the in-process scheduler runs a sync. 0 turns it off (leaving
+    # only POST /internal/sync/run).
+    interval_hours: float = Field(default=6, ge=0)
+    # How far back each run fetches. Overlapping runs is the point: a record
+    # Oura revises (a sleep score finalised the next morning) is picked up
+    # again, and a missed run loses nothing as long as the next one lands
+    # inside the window.
+    lookback_days: int = Field(default=2, ge=1, le=14)
+    # Widest window fetched in one request. A wider range -- catching up after
+    # an outage, or the backfill -- is split into windows this size. Heart
+    # rate is always capped at `oura.max_heartrate_days`.
+    chunk_days: int = Field(default=90, ge=1, le=365)
+
+    # Back-sync: walk each archived resource back through Oura's history, one
+    # window at a time, until there is nothing older. Resumable across
+    # restarts, and finished resources cost nothing on later checks.
+    backfill_enabled: bool = True
+    # How far back to go. Unset, the earliest ring's setup date (from
+    # ring_configuration) is the floor; failing that, the walk stops after
+    # `backfill_empty_chunks` empty windows in a row.
+    backfill_start: date | None = None
+    backfill_empty_chunks: int = Field(default=4, ge=1, le=100)
+
+
+class WearConfig(_Section):
+    """`wear`: polling whether the ring is on a finger. See `services/wear_service.py`."""
+
+    # How often the poller asks Oura for fresh evidence. 0 turns it off
+    # (leaving only POST /internal/wear/poll).
+    poll_interval_minutes: float = Field(default=15, ge=0)
+    # Activity days re-read on every poll, so a ring that syncs late still
+    # fills in the days it missed. Longer outages: POST /internal/wear/backfill.
+    lookback_days: int = Field(default=3, ge=1, le=14)
+    # Heart-rate samples older than this are not fetched or considered.
+    heart_rate_lookback_hours: int = Field(default=6, ge=1, le=48)
+    # Evidence older than this cannot say what is happening now: the status
+    # reads UNKNOWN until the ring syncs again.
+    max_evidence_age_minutes: int = Field(default=60, ge=5, le=24 * 60)
+    # Consecutive non-wear time needed before calling the ring off. Shorter
+    # runs are sensor gaps or a quick hand-wash. Rounded up to 5-minute slots.
+    min_non_wear_minutes: int = Field(default=15, ge=5, le=24 * 60)
+
+    @property
+    def min_non_wear_slots(self) -> int:
+        return -(-self.min_non_wear_minutes // 5)
 
 
 class GatewayAuthConfig(_Section):
@@ -320,6 +363,7 @@ SECTIONS: dict[type[_Section], str] = {
     WebhookConfig: "webhooks",
     McpConfig: "mcp",
     SyncConfig: "sync",
+    WearConfig: "wear",
     GatewayAuthConfig: "auth",
 }
 
@@ -328,22 +372,25 @@ class ConfigurationError(RuntimeError):
     """config.json is missing a section or a section is invalid."""
 
 
-def bind_sections(values: dict) -> dict[type[_Section], _Section]:
-    """Validate every section of the raw configuration, failing on the first bad one.
+def bind_section(section_type: type[_Section], key: str, raw: dict | None) -> _Section:
+    """Validate one section of the configuration, naming the bad key on failure.
 
-    `values` is framework `Configuration.values` -- the parsed config file.
-    Run once at startup, so a missing or malformed setting stops the process
-    with the offending key named, rather than failing the first request that
-    needs it.
+    Error messages carry the key and the problem, never the value -- most of
+    these are secrets.
     """
-    bound: dict[type[_Section], _Section] = {}
-    for section_type, key in SECTIONS.items():
-        try:
-            bound[section_type] = section_type.model_validate(values.get(key) or {})
-        except ValidationError as exc:
-            problems = "; ".join(
-                f"{key}.{'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
-                for err in exc.errors()
-            )
-            raise ConfigurationError(f"Invalid configuration -- {problems}") from exc
-    return bound
+    try:
+        return section_type.model_validate(raw or {})
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{key}.{'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
+            for err in exc.errors()
+        )
+        raise ConfigurationError(f"Invalid configuration -- {problems}") from exc
+
+
+def bind_sections(values: dict) -> dict[type[_Section], _Section]:
+    """Validate every section of a raw configuration dict at once."""
+    return {
+        section_type: bind_section(section_type, key, values.get(key))
+        for section_type, key in SECTIONS.items()
+    }

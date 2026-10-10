@@ -9,6 +9,7 @@ from framework.configuration.configuration import Configuration
 
 from app.models.config import (
     ConfigurationError,
+    SyncConfig,
     McpConfig,
     OuraConfig,
     ServiceConfig,
@@ -48,11 +49,8 @@ def test_optional_sections_take_their_defaults():
     sections = bind_sections(base_config_values())
 
     assert sections[ServiceConfig].name == "oura-sync"
-    assert Sections(base_config_values()).sync.resources == [
-        Resource.RING_CONFIGURATION,
-        Resource.RING_BATTERY_LEVEL,
-        Resource.PERSONAL_INFO,
-    ]
+    assert Sections(base_config_values()).sync.resources == list(Resource)
+    assert SyncConfig().interval_hours == 6
     assert Sections(base_config_values()).auth.configured is False
 
 

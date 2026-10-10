@@ -36,6 +36,9 @@ def base_config_values() -> dict:
         "redis": {"connection_string": "redis://redis.invalid:6379/0"},
         "webhooks": {"verification_token": "test-verification-token"},  # noqa: S106
         "mcp": {"api_key": "test-mcp-api-key"},  # noqa: S106 - fixture value
+        # No background sync, backfill or wear poll in tests -- they trigger them explicitly.
+        "sync": {"interval_hours": 0, "backfill_enabled": False},
+        "wear": {"poll_interval_minutes": 0},
     }
 
 
@@ -274,6 +277,25 @@ class FakeCollection:
                 return
         if upsert:
             await self.insert_one({**query, **update.get("$set", {})})
+
+    async def bulk_write(self, operations, ordered: bool = True):
+        """UpdateOne operations only -- all RecordRepository issues."""
+        upserted = modified = 0
+        for operation in operations:
+            query, update = operation._filter, operation._doc
+            match = next((d for d in self.documents if _matches(d, query)), None)
+            if match is None:
+                if operation._upsert:
+                    await self.insert_one(
+                        {**query, **update.get("$setOnInsert", {}), **update.get("$set", {})}
+                    )
+                    upserted += 1
+                continue
+            changes = update.get("$set", {})
+            if any(match.get(k) != v for k, v in changes.items()):
+                match.update(changes)
+                modified += 1
+        return type("Result", (), {"upserted_count": upserted, "modified_count": modified})()
 
     async def delete_one(self, query: dict[str, Any]):
         for index, document in enumerate(self.documents):

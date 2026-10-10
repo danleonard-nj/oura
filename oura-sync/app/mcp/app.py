@@ -17,6 +17,7 @@ registering it.
 
 from __future__ import annotations
 
+from depi import ServiceProvider
 from framework.mcp import MCPBlueprint, shared_request_state
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -24,7 +25,6 @@ from mcp.server.transport_security import TransportSecuritySettings
 from app.mcp.tools import register_tools
 from app.models.config import McpConfig, ServiceConfig
 from app.services.mcp_auth_service import MCP_SCOPE, McpAuthService
-from app.utilities.provider import ContainerProvider
 
 INSTRUCTIONS = """\
 Read-only access to the user's Oura Ring data through the Oura API v2.
@@ -46,7 +46,7 @@ REALM = "oura"
 
 
 def create_mcp_server(
-    mcp: McpConfig, service: ServiceConfig, container: ContainerProvider
+    mcp: McpConfig, service: ServiceConfig, provider: ServiceProvider
 ) -> MCPServer:
     request_state_security = None
     if mcp.request_state_secrets:
@@ -63,12 +63,12 @@ def create_mcp_server(
         log_level=service.log_level,  # type: ignore[arg-type]
         request_state_security=request_state_security,
     )
-    register_tools(server, container)
+    register_tools(server, provider)
     return server
 
 
 def create_mcp_blueprint(
-    mcp: McpConfig, service: ServiceConfig, container: ContainerProvider
+    mcp: McpConfig, service: ServiceConfig, provider: ServiceProvider
 ) -> MCPBlueprint:
     """Build the blueprint serving MCP on `mcp.path`.
 
@@ -85,7 +85,7 @@ def create_mcp_blueprint(
     blueprint = MCPBlueprint(
         "mcp",
         __name__,
-        server=create_mcp_server(mcp, service, container),
+        server=create_mcp_server(mcp, service, provider),
         stateless_http=mcp.stateless,
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
@@ -104,7 +104,7 @@ def create_mcp_blueprint(
         # consent screen with the owner secret.
         blueprint.with_oauth(
             mcp.path,
-            provider=_LazyAuthProvider(container),  # type: ignore[arg-type]
+            provider=_LazyAuthProvider(provider),  # type: ignore[arg-type]
             issuer_url=service.public_base_url,
             required_scopes=[MCP_SCOPE],
             resource_name="Oura Ring",
@@ -121,16 +121,16 @@ class _LazyAuthProvider:
     """Forwards the SDK's authorization-server calls to the DI-resolved service.
 
     `with_oauth` needs a provider instance when the routes are built, but the
-    DI provider is not constructed until `before_serving` runs inside the
-    serving loop. This resolves on each call instead of capturing an instance
-    that does not exist yet.
+    DI provider is not built until `before_serving` runs inside the serving
+    loop. This resolves on each call instead of capturing an instance that
+    does not exist yet.
     """
 
-    def __init__(self, container: ContainerProvider) -> None:
-        self._container = container
+    def __init__(self, provider: ServiceProvider) -> None:
+        self._provider = provider
 
     def _service(self) -> McpAuthService:
-        return self._container.resolve(McpAuthService)
+        return self._provider.resolve(McpAuthService)
 
     async def get_client(self, client_id):
         return await self._service().get_client(client_id)

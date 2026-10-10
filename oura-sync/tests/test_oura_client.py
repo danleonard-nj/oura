@@ -17,6 +17,7 @@ from app.clients.oura_client import (
     OuraApiClient,
     WebhookSubscriptionClient,
 )
+from app.models.errors import OuraTruncatedError
 from app.models.resources import Resource
 
 RANGED = [r for r in Resource if r is not Resource.PERSONAL_INFO]
@@ -136,17 +137,18 @@ async def test_the_current_token_is_sent_on_every_page(config):
     ]
 
 
-async def test_pagination_is_bounded(config):
-    """A server that always returns next_token must not loop forever."""
+async def test_pagination_is_bounded_and_refuses_to_return_part_of_a_range(config):
+    """A server that always returns next_token must not loop forever -- and
+    what arrived before the cut-off must not pass for the whole range."""
     client, sent = build(
         lambda r, n: httpx2.Response(200, json={"data": [{"day": "x"}], "next_token": "more"}),
         config,
     )
 
-    records = await client.fetch_range("tok", Resource.DAILY_SLEEP, "2026-09-01", "2026-09-02")
+    with pytest.raises(OuraTruncatedError):
+        await client.fetch_range("tok", Resource.DAILY_SLEEP, "2026-09-01", "2026-09-02")
 
     assert len(sent) == MAX_PAGES
-    assert len(records) == MAX_PAGES
 
 
 async def test_a_missing_data_key_is_tolerated(config):

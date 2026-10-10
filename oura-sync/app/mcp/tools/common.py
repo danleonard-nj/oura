@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 from typing import Annotated, Any, Awaitable, Callable, TypeVar
 
+from depi import ServiceProvider
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
@@ -21,7 +22,6 @@ from app.models.results import RecordSet, Summary
 from app.services.audit_service import AuditService
 from app.services.oura_service import OuraService
 from app.utilities.logging import get_correlation_id, new_correlation_id, set_correlation_id
-from app.utilities.provider import ContainerProvider
 
 T = TypeVar("T")
 
@@ -41,13 +41,18 @@ Operation = Callable[[OuraService], Awaitable[tuple[Any, DateRange | None]]]
 
 
 class ToolRunner:
-    """Runs tool bodies against services from the app's container."""
+    """Runs tool bodies against services from the app's provider.
 
-    def __init__(self, container: ContainerProvider) -> None:
-        self._container = container
+    MCP tools are called by the SDK, not Quart, so the injector cannot hand
+    them their services; they resolve from the provider at call time. Not at
+    registration: the provider is only built once the serving loop exists.
+    """
+
+    def __init__(self, provider: ServiceProvider) -> None:
+        self._provider = provider
 
     def resolve(self, service_type: type[T]) -> T:
-        return self._container.resolve(service_type)
+        return self._provider.resolve(service_type)
 
     async def run(
         self,

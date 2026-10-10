@@ -47,6 +47,10 @@ class ResourceSpec:
     max_days: int | None = None
     #: Data that effectively never changes gets the long "static" TTL.
     static: bool = False
+    #: Oura only reports the current value, not a history of records, so the
+    #: sync keeps a change log of it (resource_snapshots) instead of archiving
+    #: records (oura_records).
+    current_state: bool = False
     #: The OAuth scope Oura actually requires. Verified by probing every
     #: endpoint with a live token -- three of these are absent from Oura's
     #: OpenAPI spec, and Oura answers 401 rather than 403 when one is missing.
@@ -73,13 +77,13 @@ SPECS: dict[Resource, ResourceSpec] = {
     Resource.ENHANCED_TAG: ResourceSpec(Resource.ENHANCED_TAG, scope="tag"),
     Resource.REST_MODE_PERIOD: ResourceSpec(Resource.REST_MODE_PERIOD),
     Resource.RING_CONFIGURATION: ResourceSpec(
-        Resource.RING_CONFIGURATION, static=True, scope="ring_configuration"
+        Resource.RING_CONFIGURATION, static=True, current_state=True, scope="ring_configuration"
     ),
     Resource.RING_BATTERY_LEVEL: ResourceSpec(
         Resource.RING_BATTERY_LEVEL, scope="ring_configuration"
     ),
     Resource.PERSONAL_INFO: ResourceSpec(
-        Resource.PERSONAL_INFO, date_ranged=False, static=True, scope="personal"
+        Resource.PERSONAL_INFO, date_ranged=False, static=True, current_state=True, scope="personal"
     ),
 }
 

@@ -10,12 +10,12 @@ from __future__ import annotations
 import logging
 import time
 
+from depi import ServiceProvider
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.models.request_log import RequestLogEntry
 from app.repositories.request_log_repository import RequestLogRepository
 from app.utilities.logging import get_logger, new_correlation_id, set_correlation_id
-from app.utilities.provider import ContainerProvider
 
 CORRELATION_HEADER = "x-correlation-id"
 
@@ -46,9 +46,9 @@ class CorrelationIdMiddleware:
     Mongo hiccup here must never fail the request it is merely describing.
     """
 
-    def __init__(self, app: ASGIApp, container: ContainerProvider) -> None:
+    def __init__(self, app: ASGIApp, provider: ServiceProvider) -> None:
         self._app = app
-        self._container = container
+        self._provider = provider
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -111,16 +111,13 @@ class CorrelationIdMiddleware:
                 )
 
     async def _record_request_log(self, entry: RequestLogEntry) -> None:
-        """Persist one `RequestLogEntry`, tolerating a missing or unhealthy Mongo.
+        """Persist one `RequestLogEntry`, tolerating an unhealthy Mongo.
 
-        A request can arrive before `before_serving` has bound the provider, so
-        a missing provider is expected, not an error; anything else is a Mongo
-        problem the request itself must not fail on.
+        Middleware sits outside Quart's views, so it resolves from the provider
+        it was constructed with rather than through the injector.
         """
-        if not self._container.ready:
-            return
         try:
-            await self._container.resolve(RequestLogRepository).record(entry)
+            await self._provider.resolve(RequestLogRepository).record(entry)
         except Exception as exc:  # noqa: BLE001 - request logging must never fail a request
             _access_logger.warning(
                 "request log persistence failed",

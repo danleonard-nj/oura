@@ -19,6 +19,7 @@ from typing import Any
 from httpx2 import AsyncClient
 
 from app.models.config import OuraConfig
+from app.models.errors import OuraTruncatedError
 from app.models.resources import Resource
 
 API_URL = "https://api.ouraring.com"
@@ -49,7 +50,8 @@ RESOURCE_PATHS: dict[Resource, str] = {
 }
 
 #: Guard against a malformed `next_token` loop. Oura pages in hundreds; a range
-#: wide enough to need more than this is already refused by date validation.
+#: needing more than this raises `OuraTruncatedError` rather than returning
+#: part of the data as though it were all of it.
 MAX_PAGES = 100
 
 
@@ -118,7 +120,10 @@ class OuraApiClient:
                 return records
             query["next_token"] = next_token
 
-        return records
+        raise OuraTruncatedError(
+            f"{segment} needed more than {MAX_PAGES} pages for this range. "
+            "Narrow the range or request it in batches."
+        )
 
     @staticmethod
     def _headers(access_token: str) -> dict[str, str]:
